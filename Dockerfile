@@ -24,14 +24,18 @@ RUN pip install huggingface_hub
 # Create huggingface cache directory
 RUN mkdir -p /root/.cache/huggingface/hub
 
-# Pre-download the model manually (example for large-v3)
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='openai/whisper-large-v3', cache_dir='/root/.cache/huggingface/hub')"
+# Pre-download the transcription model (large-v3-turbo: ~6x faster than large-v3,
+# <1% WER regression on multilingual including French, released 2024-09).
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='openai/whisper-large-v3-turbo', cache_dir='/root/.cache/huggingface/hub')"
 
 # Set Huggingface cache env var so whisperx knows where to look
 ENV HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub
 
-# Install WhisperX from GitHub (this will also install faster-whisper and other dependencies)
-RUN pip install git+https://github.com/m-bain/whisperX.git@v3.3.0
+# Install WhisperX from GitHub (this will also install faster-whisper and other dependencies).
+# v3.8.5 (mainline) ships the wav2vec2 forced-alignment timestamp fixes plus the 2025
+# hallucination/attention-head patches — both relevant to the silence-padded chunk pathology
+# the local corrector module was originally written to mitigate.
+RUN pip install git+https://github.com/m-bain/whisperX.git@v3.8.5
 
 # Set working directory inside the container
 WORKDIR /app

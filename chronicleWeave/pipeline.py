@@ -24,12 +24,14 @@ except ImportError:
 
 # --- Imports ---
 from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING_CONFIG
+from .modules.prepare_tracks import prepare_tracks, DEFAULT_MAPPING_PATH
 from .modules.whisperx_corrector_core import correct_whisperx_outputs, WhisperXCorrectorConfig, DEFAULT_CONFIG as DEFAULT_CORRECTOR_CONFIG
 from .modules.convert_json_to_srt import convert_json_folder_to_srt
 from .modules.merge_srt_by_chunk import merge_srt_by_chunk, SRTMergeConfig, DEFAULT_MERGE_CONFIG
 from .modules.merge_speaker_entries import merge_speaker_entries
 from .modules.convert_srt_to_script import srt_to_script
 from .modules.llm_processor import process_with_llm, LLMConfig, DEFAULT_LLM_CONFIG
+from .modules.file_chunker import chunk_text_file_by_lines
 
 # --- Configuration Dataclasses ---
 
@@ -49,6 +51,7 @@ class PipelineConfig:
     corrected_json_folderName: str = "json_files"
     srt_folderName: str = "srt_files"
     final_folderName: str = "final_outputs"
+    script_chunks_folderName: str = "script_chunks"  # Will be created inside final_outputs by default
     merged_audio_filename: str = "merged_audio.flac"
     cut_points_filename: str = "cut_points.txt"
     merged_transcript_filename: str = "merged_transcript.srt"
@@ -61,12 +64,24 @@ class PipelineConfig:
     diarize: bool = False
     huggingface_token: Optional[str] = None # Sourced from env or this config
 
+    # Track preparation (auto-unzip + speaker rename)
+    auto_prepare_tracks: bool = True
+    speaker_mapping_path: Optional[Path] = None  # None = use packaged default
+
     # Execution Control
-    steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 9) # Default: run steps 1-8
+    steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 10) # Default: run steps 1-9
     log_level: str = "INFO"
+
+    # File Chunking Configuration
+    script_chunk_size: int = 1000  # Number of lines per chunk
+    script_chunk_filename_template: str = "script_chunk_{:02d}.txt"
+    script_chunks_in_final_folder: bool = True  # If True, chunks go inside final_outputs/, else at base level
+    script_chunks_compact_mode: bool = True  # Remove extra blank lines for more compact chunks
 
     # External Tools Config
     whisperx_docker_image: str = "chronicleweave-whisperx"
+    whisperx_model: str = "large-v3-turbo"  # Whisper checkpoint passed to `whisperx --model`.
+    whisperx_language: str = "fr"           # ISO code; "auto" lets WhisperX detect.
 
     # Module Specific Configs
     chunking_config: ChunkingConfig = field(default_factory=lambda: DEFAULT_CHUNKING_CONFIG)
@@ -114,9 +129,60 @@ log = logging.getLogger("chronicleweave.pipeline") # Specific logger for this mo
 
 # --- Helper Functions ---
 
+def _build_pipeline_config(
+    config_obj: Optional["PipelineConfig"],
+    base_path: Union[str, Path],
+    explicit_kwargs: Dict[str, Any],
+    llm_config_overrides: Optional[Union[Dict[str, Any], "LLMConfig"]],
+    extra_kwargs: Dict[str, Any],
+) -> "PipelineConfig":
+    """Merge defaults / config_obj / explicit kwargs / extra kwargs into one PipelineConfig.
+
+    Precedence (low → high): defaults → config_obj → explicit non-None args → extra_kwargs.
+    None values are ignored at every layer (so callers can pass ``None`` to mean "don't
+    override"). Unknown keys are warned about and dropped.
+    """
+    pipeline_fields = {f.name for f in fields(PipelineConfig)}
+
+    base = config_obj if isinstance(config_obj, PipelineConfig) else PipelineConfig()
+    if config_obj is not None and not isinstance(config_obj, PipelineConfig):
+        log.warning(f"Ignoring invalid config_obj type: {type(config_obj)}")
+
+    overrides: Dict[str, Any] = {}
+    for source in (explicit_kwargs, extra_kwargs):
+        for key, value in source.items():
+            if value is None or key == "base_path":
+                continue
+            if key in pipeline_fields:
+                overrides[key] = value
+            else:
+                log.warning(f"Ignoring unknown PipelineConfig field: {key!r}")
+
+    # base_path: explicit/extra wins over config_obj; resolve to absolute Path.
+    bp_source = extra_kwargs.get("base_path") or base_path or base.base_path
+    overrides["base_path"] = Path(bp_source).resolve()
+
+    # Nested LLMConfig override: dict-merge or full replace.
+    base_llm = overrides.get("llm_config") or base.llm_config
+    if isinstance(llm_config_overrides, LLMConfig):
+        overrides["llm_config"] = llm_config_overrides
+    elif isinstance(llm_config_overrides, dict):
+        llm_fields = {f.name for f in fields(LLMConfig)}
+        clean = {k: v for k, v in llm_config_overrides.items() if k in llm_fields and v is not None}
+        unknown = set(llm_config_overrides) - llm_fields
+        if unknown:
+            log.warning(f"Ignoring unknown LLMConfig fields: {unknown}")
+        if clean:
+            overrides["llm_config"] = replace(base_llm, **clean)
+    elif llm_config_overrides is not None:
+        log.warning(f"Ignoring invalid llm_config_overrides type: {type(llm_config_overrides)}")
+
+    return replace(base, **overrides)
+
+
 def should_run_step(step_number: int, steps_to_run: Union[slice, List[int], Tuple[int, ...]]) -> bool:
     """Determine if a 1-based step number should run."""
-    max_steps = 9 # Steps 1-8 exist, +1 for slice range validity
+    max_steps = 10 # Steps 1-9 exist, +1 for slice range validity
     if isinstance(steps_to_run, slice):
         start, stop, step = steps_to_run.indices(max_steps)
         # Ensure start is at least 1 for 1-based indexing of steps
@@ -226,10 +292,10 @@ def run_whisperx_docker(
     
     whisperx_args = [
         "whisperx", *input_args_for_container,
-        "--model", "large-v3", # Consider making model configurable
-        "--language", "fr",   # Consider making language configurable
+        "--model", config.whisperx_model,
+        "--language", config.whisperx_language,
         "--output_dir", str(container_whisperx_output_dir),
-        "--output_format", "json"
+        "--output_format", "json",
     ]
 
     if config.diarize:
@@ -335,12 +401,18 @@ def run_whisperx_docker(
 
 def run_pipeline(
     base_path: str = ".", # Can be relative or absolute string
-    steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 9), # Default runs steps 1-8
+    steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 10), # Default runs steps 1-9
     log_level: str = "INFO",
     run_whisperx: bool = True,
     diarize: bool = False,
     use_low_ram: bool = True,
     input_audio_folderName: Optional[str] = None, # Override default "tracks"
+    # File chunking parameters
+    script_chunk_size: Optional[int] = None,  # Number of lines per chunk
+    script_chunk_filename_template: Optional[str] = None,  # Filename template for chunks
+    script_chunks_in_final_folder: Optional[bool] = None,  # Whether to put chunks inside final_outputs/
+    script_chunks_folderName: Optional[str] = None,  # Custom folder name for chunks
+    script_chunks_compact_mode: Optional[bool] = None,  # Remove extra blank lines for compact chunks
     # Allow passing a dict to override specific LLMConfig fields, or a full LLMConfig object
     llm_config_overrides: Optional[Union[Dict[str, Any], LLMConfig]] = None,
     config_obj: Optional[PipelineConfig] = None, # Pass a full pre-configured PipelineConfig
@@ -354,12 +426,20 @@ def run_pipeline(
 
     Args:
         base_path: Base directory for the session. Default: current directory.
-        steps_to_run: 1-based steps to run (slice, list, or tuple). Default runs 1-8.
+        steps_to_run: 1-based steps to run (slice, list, or tuple). Default runs 1-9.
         log_level: Logging level ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL').
         run_whisperx: Whether to run the WhisperX Docker step automatically.
         diarize: Enable speaker diarization in WhisperX (requires Hugging Face token).
         use_low_ram: Use low RAM mode for audio chunking (pydub).
         input_audio_folderName: Optional override for the input tracks folder name.
+        
+        # File chunking parameters (Step 9):
+        script_chunk_size: Number of lines per chunk. Default: 1000.
+        script_chunk_filename_template: Filename template for chunks. Default: "script_chunk_{:02d}.txt".
+        script_chunks_in_final_folder: If True, chunks go inside final_outputs/. Default: True.
+        script_chunks_folderName: Custom folder name for chunks. Default: "script_chunks".
+        script_chunks_compact_mode: Remove extra blank lines for compact chunks. Default: True.
+        
         llm_config_overrides: Optional dict or LLMConfig object to override LLM settings.
         config_obj: An optional pre-configured PipelineConfig object.
         **kwargs: Additional configuration overrides matching PipelineConfig attributes.
@@ -371,107 +451,24 @@ def run_pipeline(
     except NameError: version_info = "unknown"
     log.info(f"Initializing chronicleweave pipeline (v{version_info})...")
 
-    # --- Configuration Merging Logic ---
-    try:
-        # Start with dataclass defaults
-        final_config_dict = vars(PipelineConfig())
-
-        # Layer 1: Update with provided config_obj if valid
-        if config_obj is not None:
-            if isinstance(config_obj, PipelineConfig):
-                final_config_dict.update(vars(config_obj))
-                log.info("Loaded base settings from provided config_obj.")
-            else:
-                log.warning(f"Invalid config_obj type provided ({type(config_obj)}), ignoring.")
-
-        # Layer 2: Update with direct arguments (filter Nones to respect config_obj or defaults)
-        # `base_path` is handled specially due to Path conversion.
-        # Other direct args:
-        direct_args_map = {
-            "steps_to_run": steps_to_run, "log_level": log_level,
-            "run_whisperx": run_whisperx, "diarize": diarize, "use_low_ram": use_low_ram,
-            "input_audio_folderName": input_audio_folderName
-        }
-        # Only update if the direct arg value is not None
-        for key, value in direct_args_map.items():
-            if value is not None:
-                final_config_dict[key] = value
-        
-        # Handle base_path separately for early Path conversion
-        # Priority: kwargs['base_path'] > direct base_path arg > config_obj.base_path > default
-        base_path_str_source = final_config_dict['base_path'] # Start with default or from config_obj
-        if base_path is not None and base_path != ".": # Direct arg, if not default
-            base_path_str_source = base_path
-        if 'base_path' in kwargs and kwargs['base_path'] is not None: # Kwarg overrides direct arg
-            base_path_str_source = kwargs['base_path']
-        
-        if not isinstance(base_path_str_source, (str, Path)):
-            raise TypeError(f"base_path must be a string or Path, got {type(base_path_str_source)}")
-        final_config_dict["base_path"] = Path(base_path_str_source).resolve()
-
-
-        # Layer 3: Update with valid kwargs (these override direct args if keys overlap, except base_path)
-        pipeline_dataclass_fields = {f.name for f in fields(PipelineConfig)}
-        unknown_kwargs_set = set()
-        for k, v_kwarg in kwargs.items():
-            if k == "base_path": continue # Already handled
-            if k in pipeline_dataclass_fields:
-                if v_kwarg is not None: # Only override if kwarg value is not None
-                    final_config_dict[k] = v_kwarg
-            else:
-                unknown_kwargs_set.add(k)
-        
-        if unknown_kwargs_set:
-            log.warning(f"Ignoring unknown top-level configuration kwargs: {unknown_kwargs_set}")
-
-        # Handle llm_config_overrides separately (for nested LLMConfig)
-        # Start with the LLMConfig from the current final_config_dict (from defaults or config_obj)
-        effective_llm_config = final_config_dict.get('llm_config', DEFAULT_LLM_CONFIG)
-        if not isinstance(effective_llm_config, LLMConfig): # Defensive
-            effective_llm_config = DEFAULT_LLM_CONFIG
-
-        if llm_config_overrides is not None:
-            if isinstance(llm_config_overrides, LLMConfig):
-                effective_llm_config = llm_config_overrides
-                log.info("Replaced LLMConfig with provided LLMConfig object.")
-            elif isinstance(llm_config_overrides, dict):
-                llm_dataclass_fields = {f.name for f in fields(LLMConfig)}
-                valid_llm_kw_overrides = {}
-                unknown_llm_kw_set = set()
-                for k_llm, v_llm in llm_config_overrides.items():
-                    if k_llm in llm_dataclass_fields:
-                        if v_llm is not None: # Only apply if value is not None
-                             valid_llm_kw_overrides[k_llm] = v_llm
-                    else:
-                        unknown_llm_kw_set.add(k_llm)
-                
-                if unknown_llm_kw_set:
-                    log.warning(f"Ignoring unknown LLMConfig override kwargs: {unknown_llm_kw_set}")
-                
-                if valid_llm_kw_overrides:
-                    try:
-                        effective_llm_config = replace(effective_llm_config, **valid_llm_kw_overrides)
-                        log.info(f"Applied LLMConfig overrides: {valid_llm_kw_overrides}")
-                    except TypeError as e: # Should not happen if fields are checked
-                        log.error(f"Error applying LLMConfig overrides: {e}. Using previous LLMConfig.")
-            else:
-                log.warning(f"Invalid type for llm_config_overrides: {type(llm_config_overrides)}. Ignoring.")
-        final_config_dict['llm_config'] = effective_llm_config
-        
-        # Create the final config instance
-        config = PipelineConfig(**final_config_dict)
-        
-        # Ensure base_path directory exists (critical for operation)
-        try:
-            config.base_path.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            log.error(f"Failed to create base_path directory {config.base_path}: {e}")
-            raise IOError(f"Critical: Could not create base_path directory {config.base_path}") from e
-
-    except (TypeError, ValueError, OSError, Exception) as e:
-        log.exception(f"Fatal error during configuration setup: {e}")
-        # Re-raise as a generic configuration error or specific type if preferred
-        raise ValueError(f"Pipeline configuration failed critically: {e}") from e
+    explicit_kwargs = {
+        "steps_to_run": steps_to_run, "log_level": log_level,
+        "run_whisperx": run_whisperx, "diarize": diarize, "use_low_ram": use_low_ram,
+        "input_audio_folderName": input_audio_folderName,
+        "script_chunk_size": script_chunk_size,
+        "script_chunk_filename_template": script_chunk_filename_template,
+        "script_chunks_in_final_folder": script_chunks_in_final_folder,
+        "script_chunks_folderName": script_chunks_folderName,
+        "script_chunks_compact_mode": script_chunks_compact_mode,
+    }
+    config = _build_pipeline_config(
+        config_obj=config_obj,
+        base_path=base_path,
+        explicit_kwargs=explicit_kwargs,
+        llm_config_overrides=llm_config_overrides,
+        extra_kwargs=kwargs,
+    )
+    config.base_path.mkdir(parents=True, exist_ok=True)
 
     log.info("Effective configuration applied.")
     if config.log_level == "DEBUG":
@@ -486,6 +483,12 @@ def run_pipeline(
     corrected_json_folder = config.get_full_path("corrected_json_folderName")
     srt_folder = config.get_full_path("srt_folderName")
     final_folder = config.get_full_path("final_folderName") # Main output for final user-facing files
+    
+    # Script chunks folder placement is conditional
+    if config.script_chunks_in_final_folder:
+        script_chunks_folder = final_folder / config.script_chunks_folderName
+    else:
+        script_chunks_folder = config.base_path / config.script_chunks_folderName
 
     # Specific file paths within the final_folder
     merged_file_path = final_folder / config.merged_audio_filename
@@ -512,6 +515,27 @@ def run_pipeline(
     pipeline_successful = True # Assume success until a step fails critically
 
     # --- Step Execution ---
+    # Step 0: Prepare tracks (auto-unzip Craig archive + apply speaker mapping)
+    # Idempotent: skipped silently when already done. Tied to Step 1 so it only
+    # runs when chunking would also run.
+    if config.auto_prepare_tracks and should_run_step(1, config.steps_to_run):
+        log.info("=== Step 0: Preparing tracks (unzip + speaker rename) ===")
+        try:
+            extracted, renamed = prepare_tracks(
+                session_path=config.base_path,
+                tracks_folder_name=config.input_audio_folderName,
+                mapping_path=config.speaker_mapping_path,
+            )
+            if extracted:
+                log.info("Craig archive extracted into tracks/.")
+            if renamed:
+                log.info(f"Speaker mapping applied: {renamed}")
+            elif not extracted:
+                log.debug("Step 0: nothing to do (already prepared).")
+        except Exception:
+            # Non-critical: if this fails, the user can still run the manual flow.
+            log.exception("!!! Step 0 (Prepare Tracks) FAILED (Non-Critical) !!!")
+
     # Step 1: Chunking Audio
     if should_run_step(1, config.steps_to_run):
         log.info("=== Step 1: Chunking audio tracks ===")
@@ -622,9 +646,42 @@ def run_pipeline(
             pipeline_successful = False
         if not pipeline_successful: return
 
-    # Step 8: LLM Processing
+   
+
+    # Step 8: Chunking Final Script
     if should_run_step(8, config.steps_to_run):
-        log.info("=== Step 8: LLM Processing (Summary/Narrative Generation) ===")
+        log.info("=== Step 8: Chunking final script ===")
+        try:
+            if not final_script_path.is_file():
+                raise FileNotFoundError(f"Final script file '{final_script_path}' for chunking not found.")
+            
+            # Create script chunks directory
+            try:
+                script_chunks_folder.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                log.exception(f"Failed creating script chunks directory: {script_chunks_folder}")
+                raise IOError(f"Could not create script chunks directory {script_chunks_folder}") from e
+            
+            # Chunk the final script
+            chunked_files = chunk_text_file_by_lines(
+                input_file=final_script_path,
+                output_dir=script_chunks_folder,
+                chunk_size=config.script_chunk_size,
+                output_filename_template=config.script_chunk_filename_template,
+                compact_mode=config.script_chunks_compact_mode
+            )
+            
+            log.info(f"Successfully created {len(chunked_files)} script chunks in {script_chunks_folder}")
+            steps_executed.append(8)
+            log.info("--- Step 8 completed ---")
+        except Exception as e:
+            log.exception("!!! Step 8 (Script Chunking) FAILED CRITICALLY !!!")
+            pipeline_successful = False
+        if not pipeline_successful: return
+
+     # Step 9: LLM Processing
+    if should_run_step(9, config.steps_to_run):
+        log.info("=== Step 9: LLM Processing (Summary/Narrative Generation) ===")
         try:
             if not final_script_path.is_file():
                 raise FileNotFoundError(f"Final script file '{final_script_path}' for LLM processing not found.")
@@ -635,12 +692,12 @@ def run_pipeline(
                 llm_config=config.llm_config,
                 pipeline_config=config # Pass the full pipeline_config for context
             )
-            steps_executed.append(8)
-            log.info("--- Step 8 completed ---")
+            steps_executed.append(9)
+            log.info("--- Step 9 completed ---")
         except Exception as e:
             # LLM processing failure is logged as an error but considered non-critical for the overall pipeline result
             # if other primary transcription steps succeeded.
-            log.exception("!!! Step 8 (LLM Processing) FAILED (Non-Critical) !!!")
+            log.exception("!!! Step 9 (LLM Processing) FAILED (Non-Critical) !!!")
             log.warning("LLM processing step encountered an error. Pipeline will continue if prior steps were successful.")
             # pipeline_successful is not set to False here to allow main pipeline to be "successful"
             # if only the LLM part fails. This behavior can be changed if LLM is critical.
@@ -650,13 +707,13 @@ def run_pipeline(
     log.info("========================================")
     if pipeline_successful:
         # Determine what was requested vs. what ran
-        all_possible_steps = list(range(1, 9)) # Steps 1 through 8
+        all_possible_steps = list(range(1, 10)) # Steps 1 through 9
         requested_steps_list: List[int] = []
         if isinstance(config.steps_to_run, slice):
-            start, stop, step_val = config.steps_to_run.indices(9) # Max steps is 9 (for 1-8)
+            start, stop, step_val = config.steps_to_run.indices(10) # Max steps is 10 (for 1-9)
             requested_steps_list = list(range(max(1, start), stop, step_val))
         elif isinstance(config.steps_to_run, (list, tuple)):
-            requested_steps_list = [s for s in config.steps_to_run if 1 <= s <= 8]
+            requested_steps_list = [s for s in config.steps_to_run if 1 <= s <= 9]
         
         if set(steps_executed) == set(requested_steps_list):
             if set(steps_executed) == set(all_possible_steps):
@@ -668,26 +725,8 @@ def run_pipeline(
             log.warning(f"Pipeline finished. Executed steps: {steps_executed}. Requested steps: {requested_steps_list}. "
                         "Some requested steps may not have run or an optional step (like LLM) may have failed.")
         log.info(f"Find outputs in: {final_folder.resolve()}")
+        log.info(f"Find script chunks in: {script_chunks_folder.resolve()}")
     else:
         log.error(f"☠️ Pipeline FAILED after executing steps: {steps_executed}. Check logs for critical errors.")
         # Re-raise a generic error to signal failure to the caller if used programmatically
         raise RuntimeError("chronicleweave pipeline failed during execution.")
-
-# Example of interactive usage (uncomment to run directly)
-# if __name__ == "__main__":
-#     # Ensure you have a 'tracks' folder with audio files in the current directory or specify base_path
-#     # e.g., run_pipeline(base_path="./my_dnd_session_audio")
-#     #
-#     # To test LLM step, ensure GEMINI_API_KEY is in your .env or environment
-#     # And that `chronicleweave/modules/prompts/en/default_summary_prompt.txt` (etc.) exist.
-#
-#     # Minimal run for testing:
-#     # Create dummy files for testing if you don't want to run all steps.
-#     # For example, to test only step 8:
-#     # Path("./dummy_session").mkdir(exist_ok=True)
-#     # Path("./dummy_session/final_outputs").mkdir(exist_ok=True)
-#     # Path("./dummy_session/final_outputs/final_script.txt").write_text("This is a test script.")
-#     # run_pipeline(base_path="./dummy_session", steps_to_run=[8], log_level="DEBUG")
-#
-#     # Full run example:
-#     # run_pipeline(log_level="DEBUG", diarize=False) # Ensure tracks folder exists with audio

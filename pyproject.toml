@@ -35,11 +35,16 @@ dependencies = [
     "srt>=3.5.2",
     "tqdm>=4.64.1",
     "numpy>=1.20.0", 
-    "google-generativeai>=0.5.0",
+    "google-genai>=1.0.0",
 ]
 
 # Optional: Define dependencies needed for development (testing, linting, building)
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: end-to-end tests that exercise the full pipeline (~30s each).",
 ]

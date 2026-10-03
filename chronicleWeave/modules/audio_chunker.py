@@ -113,7 +113,6 @@ def _merge_tracks_low_ram(speaker_files: List[Path], output_file: Path, chunk_si
     try:
         # Load tracks (still requires loading metadata, potentially some data)
         # Disable tqdm if logging level is DEBUG or lower
-        print(not sys.stdout.isatty())
         disable_tqdm = not sys.stdout.isatty() or log.getEffectiveLevel() <= logging.DEBUG
         log.debug("Loading track metadata...")
         tracks = [AudioSegment.from_file(file, format="flac") for file in tqdm(speaker_files, desc="Loading tracks", disable=disable_tqdm)]
