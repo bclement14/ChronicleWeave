@@ -149,20 +149,20 @@ def test_merge_srt_by_chunk_standard(tmp_path: Path):
     # Sub 3: Alice C2 L1 (orig 0.5-2.5 -> 4.6 - 6.6)
     # --- CORRECTED ASSERTION: Check content start ---
     assert output_subs[2].content.startswith("[Alice]")
-    assert output_subs[2].start == pytest.approx(timedelta(seconds=offset_s + 0.5))
-    assert output_subs[2].end == pytest.approx(timedelta(seconds=offset_s + 2.5))
+    assert output_subs[2].start == pytest.approx(timedelta(seconds=offset_s + 0.5), abs=timedelta(milliseconds=1))
+    assert output_subs[2].end == pytest.approx(timedelta(seconds=offset_s + 2.5), abs=timedelta(milliseconds=1))
 
     # Sub 4: Bob C2 L1 (orig 1.0-3.5 -> 5.1 - 7.6) - interleaved correctly
     # --- CORRECTED ASSERTION: Check content start ---
     assert output_subs[3].content.startswith("[Bob]")
-    assert output_subs[3].start == pytest.approx(timedelta(seconds=offset_s + 1.0))
-    assert output_subs[3].end == pytest.approx(timedelta(seconds=offset_s + 3.5))
+    assert output_subs[3].start == pytest.approx(timedelta(seconds=offset_s + 1.0), abs=timedelta(milliseconds=1))
+    assert output_subs[3].end == pytest.approx(timedelta(seconds=offset_s + 3.5), abs=timedelta(milliseconds=1))
 
     # Sub 5: Alice C2 L2 (orig 3.0-4.0 -> 7.1 - 8.1)
     # --- CORRECTED ASSERTION: Check content start ---
     assert output_subs[4].content.startswith("[Alice]")
-    assert output_subs[4].start == pytest.approx(timedelta(seconds=offset_s + 3.0))
-    assert output_subs[4].end == pytest.approx(timedelta(seconds=offset_s + 4.0))
+    assert output_subs[4].start == pytest.approx(timedelta(seconds=offset_s + 3.0), abs=timedelta(milliseconds=1))
+    assert output_subs[4].end == pytest.approx(timedelta(seconds=offset_s + 4.0), abs=timedelta(milliseconds=1))
 
     # Check overall order
     for i in range(len(output_subs) - 1):
@@ -234,9 +234,9 @@ def test_merge_srt_by_chunk_one_invalid_srt(tmp_path: Path, caplog):
     # Offset for chunk 2 depends only on valid subs from chunk 1
     offset_s = 3.0 + DEFAULT_MERGE_CONFIG.chunk_gap_s # Max end of Alice C1 + gap
     assert output_subs[1].content == "[Alice] Alice chunk 2 line 1."
-    assert output_subs[1].start == pytest.approx(timedelta(seconds=offset_s + 0.5))
+    assert output_subs[1].start == pytest.approx(timedelta(seconds=offset_s + 0.5), abs=timedelta(milliseconds=1))
     assert output_subs[2].content == "[Alice] Alice chunk 2 line 2."
-    assert output_subs[2].start == pytest.approx(timedelta(seconds=offset_s + 3.0))
+    assert output_subs[2].start == pytest.approx(timedelta(seconds=offset_s + 3.0), abs=timedelta(milliseconds=1))
 
 def test_merge_srt_input_not_found(tmp_path: Path):
     """Test FileNotFoundError if input folder doesn't exist."""

@@ -1,48 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "chronicleweave"
-version = "1.0.0" 
+version = "1.1.0"
 description = "A modular audio processing pipeline for chunking, transcribing with WhisperX, and producing readable scripts."
-authors = [
-    { name="Benjamin CLEMENT", email="benji.usable@gmail.com" }
-]
+authors = [{ name = "Benjamin CLEMENT", email = "benji.usable@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
-
-# Keywords
-keywords = ['whisperx', 'transcription', 'audio', 'pipeline', 'speech-recognition', 'srt', 'subtitles', 'podcast', 'meeting']
-
-# PyPI classifiers for categorization
+keywords = ["whisperx", "transcription", "audio", "pipeline", "speech-recognition", "srt"]
 classifiers = [
-    "Development Status :: 3 - Alpha", 
-    "Intended Audience :: Developers",
-    "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: GNU General Public License v3",
-    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Topic :: Multimedia :: Sound/Audio :: Analysis",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
-    "Topic :: Text Processing :: Linguistic",
-    "Topic :: Utilities",
 ]
-
 dependencies = [
     "pydub>=0.25.1",
     "srt>=3.5.2",
     "tqdm>=4.64.1",
-    "numpy>=1.20.0", 
+    "numpy>=1.20.0",
     "google-genai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "audioop-lts; python_version >= '3.13'",
 ]
 
-# Optional: Define dependencies needed for development (testing, linting, building)
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-]
+dev = ["pytest>=8"]
+
+[project.scripts]
+chronicleweave = "chronicleweave.cli:main"
+chronicleweave-batch = "chronicleweave.cli:batch_main"
+
+[tool.setuptools.packages.find]
+include = ["chronicleweave*"]
+
+[tool.setuptools.package-data]
+chronicleweave = ["modules/prompts/**/*"]
 
 [tool.pytest.ini_options]
 markers = [
