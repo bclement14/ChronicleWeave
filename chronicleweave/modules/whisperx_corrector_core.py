@@ -1187,8 +1187,7 @@ def _process_single_file(
         original_segments = data.get("segments", [])
         stats["original_segments"] = len(original_segments)
         if not original_segments:
-            log.warning(f"No segments found in {input_file_path}")
-            stats["error"] = "no_segments"
+            log.info(f"No segments in {input_file_path} (silent chunk); writing empty output")
             data["segments"] = []
             # Write empty file
             if config.safe_write:
@@ -1369,6 +1368,7 @@ def correct_whisperx_outputs(
         log.warning(
             f"{error_count} files failed during processing. Please review logs."
         )
+        raise RuntimeError(f"{error_count} file(s) failed correction; see the log above.")
 
 
 # --- Example Usage (Isolated) ---

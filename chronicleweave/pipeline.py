@@ -13,7 +13,7 @@ from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING
 from .modules.prepare_tracks import prepare_tracks, speaker_config_from_env, SpeakerConfig
 from .modules.whisperx_corrector_core import correct_whisperx_outputs, WhisperXCorrectorConfig, DEFAULT_CONFIG as DEFAULT_CORRECTOR_CONFIG
 from .modules.convert_json_to_srt import convert_json_folder_to_srt
-from .modules.merge_srt_by_chunk import merge_srt_by_chunk, SRTMergeConfig, DEFAULT_MERGE_CONFIG
+from .modules.merge_srt_by_chunk import merge_srt_by_chunk
 from .modules.merge_speaker_entries import merge_speaker_entries
 from .modules.convert_srt_to_script import srt_to_script
 from .modules.llm_processor import process_with_llm, LLMConfig, DEFAULT_LLM_CONFIG
@@ -72,7 +72,6 @@ class PipelineConfig:
     # Module Specific Configs
     chunking_config: ChunkingConfig = field(default_factory=lambda: DEFAULT_CHUNKING_CONFIG)
     corrector_config: WhisperXCorrectorConfig = field(default_factory=lambda: DEFAULT_CORRECTOR_CONFIG)
-    srtmerge_config: SRTMergeConfig = field(default_factory=lambda: DEFAULT_MERGE_CONFIG)
     llm_config: LLMConfig = field(default_factory=lambda: DEFAULT_LLM_CONFIG)
 
     def get_full_path(self, folder_or_file_attr: str) -> Path:
@@ -95,7 +94,7 @@ class PipelineConfig:
         for key, value in cfg_dict.items():
             if isinstance(value, Path):
                 cfg_dict[key] = f".../{value.name}" if len(str(value)) > 60 else str(value)
-            elif isinstance(value, (ChunkingConfig, WhisperXCorrectorConfig, SRTMergeConfig)):
+            elif isinstance(value, (ChunkingConfig, WhisperXCorrectorConfig)):
                 # For other nested configs, you might want a simple class name or their own __str__
                 cfg_dict[key] = f"<{value.__class__.__name__} Instance>"
 
@@ -481,7 +480,7 @@ def run_pipeline(
                 raise FileNotFoundError(f"WhisperX output directory '{whisperx_output_folder}' for correction not found.")
             correct_whisperx_outputs(
                 input_dir=whisperx_output_folder, output_dir=corrected_json_folder,
-                config=config.corrector_config
+                overwrite=True, config=config.corrector_config
             )
             steps_executed.append(3); log.info("--- Step 3 completed ---")
         except Exception as e:
@@ -511,7 +510,7 @@ def run_pipeline(
             merge_srt_by_chunk(
                 srt_folder=srt_folder, output_dir=final_folder, # Merged SRT goes to final_outputs
                 output_filename=config.merged_transcript_filename,
-                config=config.srtmerge_config
+                cut_points_file=cut_points_file_path
             )
             steps_executed.append(5); log.info("--- Step 5 completed ---")
         except Exception as e:

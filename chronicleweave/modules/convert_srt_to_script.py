@@ -1,5 +1,6 @@
 # chronicleweave/modules/convert_srt_to_script.py
 
+import os
 import re
 import logging
 from pathlib import Path
@@ -81,7 +82,9 @@ def srt_to_script(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # Join the extracted dialogue lines with double newlines
         final_script_content = "\n\n".join(output_lines)
-        output_path.write_text(final_script_content, encoding="utf-8")
+        tmp_path = output_path.with_name(output_path.name + ".tmp")
+        tmp_path.write_text(final_script_content, encoding="utf-8")
+        os.replace(tmp_path, output_path)
         log.info("Plain text script saved successfully.")
     except Exception as e:
         log.exception(f"Failed to write output script file: {output_path}")

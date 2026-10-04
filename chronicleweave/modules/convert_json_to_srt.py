@@ -181,12 +181,12 @@ def convert_json_folder_to_srt(input_dir: Union[str, Path], output_dir: Union[st
     # --- File Processing ---
     json_files = list(input_path.glob("*.json"))
     if not json_files:
-        log.warning(f"No JSON files found in '{input_path}'. Nothing to convert.")
-        return
+        raise FileNotFoundError(f"No JSON files in {input_path}")
 
     log.info(f"Found {len(json_files)} JSON files to convert.")
     success_count = 0
     error_count = 0
+    failed: List[str] = []
 
     # Disable tqdm if logging level is DEBUG or lower
     disable_tqdm = not sys.stdout.isatty() or log.getEffectiveLevel() <= logging.DEBUG
@@ -198,6 +198,7 @@ def convert_json_folder_to_srt(input_dir: Union[str, Path], output_dir: Union[st
             success_count += 1
         else:
             error_count += 1
+            failed.append(json_file_path.name)
             log.warning(f"Failed to convert {json_file_path.name}. Check previous error messages.")
 
     # --- Summary Logging ---
@@ -205,6 +206,8 @@ def convert_json_folder_to_srt(input_dir: Union[str, Path], output_dir: Union[st
     log.info(f"Successfully converted: {success_count} files.")
     if error_count > 0:
         log.warning(f"Failed to convert: {error_count} files. Please review logs.")
+    if failed:
+        raise RuntimeError(f"JSON to SRT conversion failed for: {', '.join(sorted(failed))}")
 
 
 # --- Example Usage ---
