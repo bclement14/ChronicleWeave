@@ -108,6 +108,77 @@ def test_coverage_uses_existing_chunk_files(tmp_path):
     assert expected_chunk_stems(cfg) == ["GM-01", "GM-02", "Pen-01"]
 
 
+def test_expected_chunk_stems_reports_calling_step(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    with pytest.raises(PipelineError) as err:
+        expected_chunk_stems(cfg, 4)
+    assert err.value.step == 4
+
+
+def _put(tmp_path, *names):
+    for name in names:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+
+
+def test_step_inputs_start_3_needs_chunks_for_coverage(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    _put(tmp_path, "wx_output/GM-01.json")
+    with pytest.raises(PipelineError, match="chunked_tracks"):
+        check_step_inputs(cfg, 3, 3)
+
+
+def test_step_inputs_cut_points_only_when_step_5_in_range(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    _put(tmp_path, "wx_output/GM-01.json", "chunked_tracks/GM-01.flac")
+    check_step_inputs(cfg, 3, 4)
+    with pytest.raises(PipelineError, match="cut_points"):
+        check_step_inputs(cfg, 3, 5)
+
+
+def test_step_inputs_start_7_needs_json_and_chunks(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    _put(tmp_path, "final_outputs/cleaned_transcript.srt", "chunked_tracks/GM-01.flac")
+    with pytest.raises(PipelineError, match="json_files"):
+        check_step_inputs(cfg, 7, 7)
+    _put(tmp_path, "json_files/GM-01.json")
+    check_step_inputs(cfg, 7, 8)
+
+
+def test_step_inputs_start_5_with_step_7_needs_json(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    _put(tmp_path, "srt_files/GM-01.srt", "final_outputs/cut_points.txt", "chunked_tracks/GM-01.flac")
+    check_step_inputs(cfg, 5, 6)
+    with pytest.raises(PipelineError, match="json_files"):
+        check_step_inputs(cfg, 5, 7)
+
+
+def test_step_inputs_manual_mode_uses_wx_output_as_expected_set(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path, run_whisperx=False)
+    _put(tmp_path, "json_files/GM-01.json")
+    with pytest.raises(PipelineError, match="wx_output"):
+        check_step_inputs(cfg, 4, 4)
+    _put(tmp_path, "wx_output/GM-01.json")
+    check_step_inputs(cfg, 4, 4)
+
+
+def test_step_inputs_step_9_needs_final_script(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    with pytest.raises(PipelineError, match="final_script"):
+        check_step_inputs(cfg, 9, 9)
+
+
+@pytest.mark.parametrize("in_final,folder", [(False, "final_outputs"), (True, ".")])
+def test_cleanup_guard_refuses_final_outputs_folder(tmp_path, in_final, folder):
+    _layout(tmp_path)
+    cfg = PipelineConfig(base_path=tmp_path, script_chunks_in_final_folder=in_final, script_chunks_folderName=folder)
+    with pytest.raises(PipelineError, match="final outputs"):
+        cleanup_outputs(cfg, 1)
+    assert (tmp_path / "final_outputs" / "final_script.txt").exists()
+    assert (tmp_path / "chunked_tracks").exists()  # nothing deleted before the guard
+
+
 def _final(tmp_path, script, jsons):
     (tmp_path / "final_outputs").mkdir(exist_ok=True)
     (tmp_path / "final_outputs" / "final_script.txt").write_text(script, encoding="utf-8")

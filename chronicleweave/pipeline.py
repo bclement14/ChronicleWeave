@@ -42,6 +42,7 @@ class StepRange(NamedTuple):
 DEFAULT_STEPS = StepRange(1, 8)
 LAST_CLEANUP_STEP = 8
 DONE_MARKER_NAME = ".chronicleweave_done.json"
+RUNNING_MARKER_NAME = ".chronicleweave_running"
 LOG_FILE_NAME = "pipeline.log"
 
 
@@ -298,19 +299,26 @@ def step_output_paths(config: PipelineConfig, step: int) -> List[Path]:
 def _guard_deletable(config: PipelineConfig, paths: Sequence[Path]) -> None:
     session = config.base_path.resolve()
     tracks = config.get_full_path("input_audio_folderName").resolve()
+    final = config.get_full_path("final_folderName").resolve()
     for path in paths:
         resolved = path.resolve()
         if resolved == session or session not in resolved.parents:
             raise PipelineError(0, f"Refusing to delete {path}: outside the session folder {session}")
         if resolved == tracks or tracks in resolved.parents or resolved in tracks.parents:
             raise PipelineError(0, f"Refusing to delete {path}: overlaps the input tracks folder {tracks}")
+        if resolved == final or resolved in final.parents:
+            raise PipelineError(0, f"Refusing to delete {path}: it is or contains the final outputs folder {final}")
         name = resolved.name.lower()
         if name.startswith("craig-") and name.endswith(".zip"):
             raise PipelineError(0, f"Refusing to delete Craig archive {path}")
 
 
+def _cleanup_paths(config: PipelineConfig, first_step: int) -> List[Path]:
+    return [p for s in range(first_step, LAST_CLEANUP_STEP + 1) for p in step_output_paths(config, s)]
+
+
 def cleanup_outputs(config: PipelineConfig, first_step: int) -> List[Path]:
-    paths = [p for s in range(first_step, LAST_CLEANUP_STEP + 1) for p in step_output_paths(config, s)]
+    paths = _cleanup_paths(config, first_step)
     _guard_deletable(config, paths)
     removed: List[Path] = []
     for path in paths:
@@ -325,50 +333,71 @@ def cleanup_outputs(config: PipelineConfig, first_step: int) -> List[Path]:
     return removed
 
 
-def check_step_inputs(config: PipelineConfig, first_step: int) -> None:
+class _StepInput(NamedTuple):
+    producer: int           # step that writes it; 0 = made outside steps 1-9 (manual-mode WhisperX JSON)
+    path: Path
+    pattern: Optional[str]  # glob that must match inside `path`; None = `path` is a file
+    what: str
+
+
+def _step_inputs(config: PipelineConfig, step: int) -> List[_StepInput]:
+    """What step `step` reads. The expected set (coverage, final gate) comes from chunked_tracks/,
+    or from the hand-placed wx_output/ in manual mode (see expected_chunk_stems)."""
     final = config.get_full_path("final_folderName")
+    wx_json = _StepInput(2 if config.run_whisperx else 0, config.get_full_path("whisperx_output_folderName"),
+                         "*.json", "WhisperX JSON files")
+    expected = (_StepInput(1, config.get_full_path("chunks_audio_folderName"), "*.flac", "chunk FLAC files")
+                if config.run_whisperx else wx_json)
+    corrected = _StepInput(3, config.get_full_path("corrected_json_folderName"), "*.json", "corrected JSON files")
+    cut_points = _StepInput(1, final / config.cut_points_filename, None, "cut points")
+    script = _StepInput(7, final / config.final_script_filename, None, "final script")
+    table = {
+        2: [expected],
+        3: [wx_json, expected],
+        4: [corrected, expected],
+        5: [_StepInput(4, config.get_full_path("srt_folderName"), "*.srt", "SRT files"), cut_points],
+        6: [_StepInput(5, final / config.merged_transcript_filename, None, "merged transcript")],
+        7: [_StepInput(6, final / config.cleaned_transcript_filename, None, "cleaned transcript"),
+            expected, corrected],
+        8: [script],
+        9: [script],
+    }
+    return table.get(step, [])
 
-    def need_glob(folder: Path, pattern: str, what: str) -> None:
-        if not folder.is_dir() or not any(folder.glob(pattern)):
-            raise PipelineError(first_step, f"missing input for step {first_step}: no {what} in {folder}")
 
-    def need_file(path: Path) -> None:
-        if not path.is_file():
-            raise PipelineError(first_step, f"missing input for step {first_step}: {path}")
+def check_step_inputs(config: PipelineConfig, first_step: int, last_step: Optional[int] = None) -> None:
+    """Fail before anything is deleted if a step in first..last needs an input that no step in the range makes.
 
+    `last_step` defaults to the default range end (8), or `first_step` when that is later."""
+    last = max(first_step, DEFAULT_STEPS.last) if last_step is None else last_step
     if first_step == 1:
         tracks = config.get_full_path("input_audio_folderName")
         has_archive = any(p.is_file() for p in config.base_path.glob("craig-*.flac.zip"))
         if not has_archive and not (tracks.is_dir() and any(tracks.glob("*.flac"))):
             raise PipelineError(1, f"missing input for step 1: no Craig archive and no FLAC in {tracks}")
-    elif first_step == 2:
-        need_glob(config.get_full_path("chunks_audio_folderName"), "*.flac", "chunk FLAC files")
-        need_file(final / config.cut_points_filename)
-        if not config.run_whisperx:
-            need_glob(config.get_full_path("whisperx_output_folderName"), "*.json", "WhisperX JSON files")
-    elif first_step == 3:
-        need_glob(config.get_full_path("whisperx_output_folderName"), "*.json", "WhisperX JSON files")
-    elif first_step == 4:
-        need_glob(config.get_full_path("corrected_json_folderName"), "*.json", "corrected JSON files")
-    elif first_step == 5:
-        need_glob(config.get_full_path("srt_folderName"), "*.srt", "SRT files")
-        need_file(final / config.cut_points_filename)
-    elif first_step == 6:
-        need_file(final / config.merged_transcript_filename)
-    elif first_step == 7:
-        need_file(final / config.cleaned_transcript_filename)
-    else:
-        need_file(final / config.final_script_filename)
+    checked: Set[Path] = set()
+    for step in range(first_step, last + 1):
+        for need in _step_inputs(config, step):
+            if need.producer >= first_step or need.path in checked:
+                continue  # made by a step of this run, or already checked
+            checked.add(need.path)
+            if need.pattern is None:
+                if not need.path.is_file():
+                    raise PipelineError(first_step, f"missing input for step {step}: {need.what} {need.path}")
+            elif not need.path.is_dir() or not any(need.path.glob(need.pattern)):
+                raise PipelineError(first_step, f"missing input for step {step}: no {need.what} in {need.path}")
 
 
-def expected_chunk_stems(config: PipelineConfig) -> List[str]:
+def expected_chunk_stems(config: PipelineConfig, step: int = 2) -> List[str]:
+    """Every chunk item step 1 produced (or, in manual mode, every hand-placed WhisperX JSON).
+    `step` is the step reported if none is found."""
     if config.run_whisperx:
         folder, pattern = config.get_full_path("chunks_audio_folderName"), "*.flac"
     else:
         folder, pattern = config.get_full_path("whisperx_output_folderName"), "*.json"
     stems = sorted(p.stem for p in folder.glob(pattern)) if folder.is_dir() else []
     if not stems:
-        raise PipelineError(2, f"no chunk items found in {folder}")
+        raise PipelineError(step, f"no chunk items found in {folder}")
     return stems
 
 
@@ -602,44 +631,51 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
     merged_srt = final / config.merged_transcript_filename
     cleaned_srt = final / config.cleaned_transcript_filename
     script = final / config.final_script_filename
+    done_marker = final / DONE_MARKER_NAME
+    running_marker = final / RUNNING_MARKER_NAME
+    rebuilds_script = steps.first <= 7
     log.info(f"Session {config.base_path} — steps {steps.first}-{steps.last}, model {config.whisperx_model}")
 
+    # Start of run, in this order (spec 4.7): speaker config -> step 0 -> input checks -> delete-path
+    # guard -> done-marker removal -> run-in-progress marker -> cleanup. Nothing is deleted before
+    # every check has passed; step 0 only touches tracks/.
     speakers = config.speakers
     if speakers is None and (steps.includes(1) or steps.includes(7)):
-        # an input of step 0 and of the step-7 gate: read before anything is deleted;
-        # a missing CW_SPEAKERS fails here, logged
+        # an input of step 0 and of the step-7 gate; a missing CW_SPEAKERS fails here, logged
         speakers = _run_step(0, "Reading speaker configuration", speaker_config_from_env)
-
-    if steps.first <= LAST_CLEANUP_STEP:
-        check_step_inputs(config, steps.first)
-        marker = final / DONE_MARKER_NAME
-        if steps.first <= 7 and marker.exists():
-            marker.unlink()  # the final script is about to be rebuilt
-        cleanup_outputs(config, steps.first)
-    final.mkdir(parents=True, exist_ok=True)
-
     if steps.includes(1):
         _run_step(0, "Preparing tracks", lambda: prepare_tracks(
             config.base_path, speakers, config.input_audio_folderName, rename=config.auto_prepare_tracks))
+    check_step_inputs(config, steps.first, steps.last)
+    if steps.first <= LAST_CLEANUP_STEP:
+        _guard_deletable(config, _cleanup_paths(config, steps.first))
+    final.mkdir(parents=True, exist_ok=True)
+    if rebuilds_script:
+        done_marker.unlink(missing_ok=True)  # the final script is about to be rebuilt
+        running_marker.write_text(started.isoformat(timespec="seconds"), encoding="utf-8")
+    if steps.first <= LAST_CLEANUP_STEP:
+        _run_step(0, "Removing previous outputs", lambda: cleanup_outputs(config, steps.first))
+
+    if steps.includes(1):
         _run_step(1, "Chunking audio", lambda: chunk_audio(
             tracks, chunks, final / config.merged_audio_filename, cut_points, config.chunking_config))
 
     def transcribe():
         if config.run_whisperx:
             run_whisperx_docker(config.base_path, config.chunks_audio_folderName, config)
-        check_coverage(2, wx, expected_chunk_stems(config), ".json")
+        check_coverage(2, wx, expected_chunk_stems(config, 2), ".json")
 
     if steps.includes(2):
         _run_step(2, "WhisperX transcription", transcribe)
     if steps.includes(3):
         def correct():
             correct_whisperx_outputs(wx, jsons, overwrite=True, config=config.corrector_config)
-            check_coverage(3, jsons, expected_chunk_stems(config), ".json")
+            check_coverage(3, jsons, expected_chunk_stems(config, 3), ".json")
         _run_step(3, "Correcting WhisperX output", correct)
     if steps.includes(4):
         def to_srt():
             convert_json_folder_to_srt(input_dir=jsons, output_dir=srts)
-            check_coverage(4, srts, expected_chunk_stems(config), ".srt")
+            check_coverage(4, srts, expected_chunk_stems(config, 4), ".srt")
         _run_step(4, "Converting JSON to SRT", to_srt)
     if steps.includes(5):
         _run_step(5, "Merging SRT files by chunk", lambda: merge_srt_by_chunk(
@@ -651,7 +687,7 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
     if steps.includes(7):
         def write_script():
             srt_to_script(input_srt_path=cleaned_srt, output_script_path=script)
-            check_final_script(config, expected_chunk_stems(config), speakers)
+            check_final_script(config, expected_chunk_stems(config, 7), speakers)
         _run_step(7, "Creating final script", write_script)
     if steps.includes(8):
         def chunk_script():
@@ -666,6 +702,7 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
         _run_step(9, "LLM processing", lambda: process_with_llm(
             final_script_file=script, output_dir=final, llm_config=config.llm_config, pipeline_config=config))
 
-    if steps.last >= 7 and steps.first <= 7:
+    if steps.includes(7):  # the final gate passed
         write_completion_marker(config, steps, started, datetime.now())
+        running_marker.unlink(missing_ok=True)
     log.info(f"Steps {steps.first}-{steps.last} finished successfully for {config.base_path.name}.")
