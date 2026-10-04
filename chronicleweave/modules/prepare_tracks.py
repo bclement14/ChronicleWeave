@@ -136,6 +136,7 @@ def _extract_missing(archive: Path, tracks: Path, cfg: SpeakerConfig, result: Pr
     tmp = tracks / _EXTRACT_TMP
     with zipfile.ZipFile(archive) as zf:
         wanted: List[Tuple[zipfile.ZipInfo, str]] = []
+        claimed: Dict[str, str] = {}
         for member in zf.infolist():
             name = Path(member.filename).name
             if member.is_dir() or not name.lower().endswith(".flac"):
@@ -146,6 +147,11 @@ def _extract_missing(archive: Path, tracks: Path, cfg: SpeakerConfig, result: Pr
             if kind == "ignored":
                 continue
             final_name = f"{tag}.flac"
+            if final_name in claimed:
+                raise TrackPreparationError(
+                    f"Archive entries {claimed[final_name]!r} and {member.filename!r} both map to Tag {tag!r}."
+                )
+            claimed[final_name] = member.filename
             final_path = tracks / final_name
             if final_path.exists():
                 if final_path.stat().st_size != member.file_size:
@@ -175,8 +181,11 @@ def prepare_tracks(
     tracks = session_path / tracks_folder_name
     result = PrepareResult()
     leftover = tracks / _EXTRACT_TMP
-    if leftover.exists():
-        shutil.rmtree(leftover)
+    if rename and (leftover.exists() or leftover.is_symlink()):
+        if leftover.is_dir() and not leftover.is_symlink():
+            shutil.rmtree(leftover)
+        else:
+            leftover.unlink()
         log.warning(f"Removed leftover {leftover} from an interrupted extraction.")
     if tracks.is_dir():
         _normalise_existing(tracks, speakers, rename, result)

@@ -213,3 +213,20 @@ def test_validate_only_mode_accepts_tags(tmp_path, cfg):
     tracks.mkdir()
     (tracks / "GM.flac").write_bytes(b"gm")
     assert prepare_tracks(tmp_path, cfg, rename=False).tags == ["GM"]
+
+
+def test_duplicate_tag_in_archive_fails_and_extracts_nothing(tmp_path, cfg):
+    _zip(tmp_path, {"1-gamemaster.flac": b"aa", "7-gamemaster.flac": b"bb", "2-player_one.flac": b"cc"})
+    with pytest.raises(TrackPreparationError, match="1-gamemaster.flac.*7-gamemaster.flac.*GM"):
+        prepare_tracks(tmp_path, cfg)
+    tracks = tmp_path / "tracks"
+    assert not tracks.exists() or list(tracks.glob("*.flac")) == []
+
+
+def test_validate_only_keeps_extract_leftover(tmp_path, cfg):
+    tracks = tmp_path / "tracks"
+    leftover = tracks / ".extract-tmp"
+    leftover.mkdir(parents=True)
+    (tracks / "GM.flac").write_bytes(b"gm")
+    assert prepare_tracks(tmp_path, cfg, rename=False).tags == ["GM"]
+    assert leftover.exists()
