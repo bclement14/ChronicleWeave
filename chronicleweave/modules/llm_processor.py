@@ -203,6 +203,7 @@ def process_with_llm(
     api_key = _load_api_key(llm_config.gemini_api_key_env_var)
     if not api_key:
         raise ValueError(f"Missing Gemini API key (env var: {llm_config.gemini_api_key_env_var})")
+    failures: List[str] = []
 
     try:
         current_session_script_content = final_script_file.read_text(encoding="utf-8")
@@ -258,8 +259,10 @@ def process_with_llm(
             log.info(f"Current session concise summary saved to: {output_dir / llm_config.output_summary_filename}")
         except KeyError as e:
             log.error(f"Prompt B is missing an expected key for formatting: {e}")
+            failures.append(f"summary prompt: missing key {e}")
         except Exception as e:
             log.error(f"Failed to generate or save current session concise summary: {e}")
+            failures.append(f"summary: {e}")
 
     # --- 3. Generate Current Session Narrative (Prompt A) ---
     if llm_config.enable_narrative:
@@ -282,8 +285,10 @@ def process_with_llm(
             log.info(f"Current session narrative saved to: {output_dir / llm_config.output_narrative_filename}")
         except KeyError as e:
             log.error(f"Prompt A is missing an expected key for formatting: {e}")
+            failures.append(f"narrative prompt: missing key {e}")
         except Exception as e:
             log.error(f"Failed to generate or save current session narrative: {e}")
+            failures.append(f"narrative: {e}")
 
     # --- 4. Generate NEW Cumulative Meta-Summary (Prompt C) ---
     if llm_config.enable_cumulative_summary:
@@ -324,7 +329,11 @@ def process_with_llm(
                 log.info(f"New cumulative campaign summary saved to: {cumulative_summary_file_path}")
             except KeyError as e:
                 log.error(f"Prompt C is missing an expected key for formatting: {e}")
+                failures.append(f"cumulative summary prompt: missing key {e}")
             except Exception as e:
                 log.error(f"Failed to generate or save new cumulative campaign summary: {e}")
+                failures.append(f"cumulative summary: {e}")
 
+    if failures:
+        raise RuntimeError("LLM processing failed: " + "; ".join(failures))
     log.info("LLM processing with cumulative summary logic finished.")

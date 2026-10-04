@@ -13,7 +13,7 @@ def _explicit(**overrides):
     """Default explicit_kwargs (all None) with selected overrides applied."""
     base = {
         "steps_to_run": None, "log_level": None,
-        "run_whisperx": None, "diarize": None, "use_low_ram": None,
+        "run_whisperx": None, "diarize": None,
         "input_audio_folderName": None,
         "script_chunk_size": None, "script_chunk_filename_template": None,
         "script_chunks_in_final_folder": None, "script_chunks_folderName": None,

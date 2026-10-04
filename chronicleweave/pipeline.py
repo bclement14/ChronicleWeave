@@ -1,12 +1,17 @@
 # chronicleweave/pipeline.py
 
+import json
 import os
+import re
+import shutil
 import subprocess
 import logging
 import sys
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field, replace, fields
-from typing import Optional, Union, List, Tuple, Sequence, Dict, Any, Mapping
+from typing import Optional, Union, List, Sequence, Dict, Any, Mapping, NamedTuple, Iterator, Set
 
 # --- Imports ---
 from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING_CONFIG
@@ -25,6 +30,60 @@ from .modules.file_chunker import chunk_text_file_by_lines
 # For simplicity, if LLMConfig is simple or its __str__ is also basic, this might not be strictly needed.
 # However, it's good practice if they reference each other in complex ways.
 # class LLMConfig: ... # This would be needed if LLMConfig also had a complex __str__ referencing PipelineConfig
+
+class StepRange(NamedTuple):
+    first: int
+    last: int
+
+    def includes(self, step: int) -> bool:
+        return self.first <= step <= self.last
+
+
+DEFAULT_STEPS = StepRange(1, 8)
+LAST_CLEANUP_STEP = 8
+DONE_MARKER_NAME = ".chronicleweave_done.json"
+LOG_FILE_NAME = "pipeline.log"
+
+
+class PipelineError(RuntimeError):
+    def __init__(self, step: int, message: str):
+        super().__init__(f"Step {step} failed: {message}")
+        self.step = step
+
+
+def parse_steps(spec) -> StepRange:
+    if spec is None:
+        return DEFAULT_STEPS
+    if isinstance(spec, StepRange):
+        first, last = spec
+    elif isinstance(spec, str):
+        text = spec.strip()
+        try:
+            if "-" in text:
+                a, b = text.split("-", 1)
+                first, last = int(a), int(b)
+            else:
+                first = last = int(text)
+        except ValueError as e:
+            raise ValueError(f"Invalid --steps value {spec!r}; use e.g. '1-8' or '5'") from e
+    elif isinstance(spec, int):
+        first = last = spec
+    elif isinstance(spec, slice):
+        first = spec.start if spec.start is not None else 1
+        last = (spec.stop - 1) if spec.stop is not None else 9
+    elif isinstance(spec, (list, tuple)):
+        values = sorted({int(v) for v in spec})
+        if not values:
+            raise ValueError("Empty step selection")
+        if values != list(range(values[0], values[-1] + 1)):
+            raise ValueError(f"Steps must be one contiguous range, got {list(spec)}")
+        first, last = values[0], values[-1]
+    else:
+        raise ValueError(f"Unsupported steps value {spec!r}")
+    if not (1 <= first <= last <= 9):
+        raise ValueError(f"Steps must satisfy 1 <= first <= last <= 9, got {first}-{last}")
+    return StepRange(first, last)
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -45,16 +104,16 @@ class PipelineConfig:
     final_script_filename: str = "final_script.txt"
 
     # Core Flags
-    use_low_ram: bool = True
     run_whisperx: bool = True
     diarize: bool = False
     huggingface_token: Optional[str] = None # Sourced from env or this config
 
     # Track preparation (auto-unzip + speaker rename)
     auto_prepare_tracks: bool = True
+    speakers: Optional[SpeakerConfig] = None  # None -> read CW_SPEAKERS/CW_IGNORE_TRACKS from the environment
 
     # Execution Control
-    steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 10) # Default: run steps 1-9
+    steps_to_run: StepRange = DEFAULT_STEPS
     log_level: str = "INFO"
 
     # File Chunking Configuration
@@ -210,20 +269,195 @@ def _build_pipeline_config(
     return replace(base, **overrides)
 
 
-def should_run_step(step_number: int, steps_to_run: Union[slice, List[int], Tuple[int, ...]]) -> bool:
-    """Determine if a 1-based step number should run."""
-    max_steps = 10 # Steps 1-9 exist, +1 for slice range validity
-    if isinstance(steps_to_run, slice):
-        start, stop, step = steps_to_run.indices(max_steps)
-        # Ensure start is at least 1 for 1-based indexing of steps
-        start = max(1, start if start is not None else 1)
-        # Ensure stop is at least start, and not more than max_steps
-        stop = max(start, stop if stop is not None else max_steps)
-        return step_number in range(start, stop, step)
-    if isinstance(steps_to_run, (list, tuple)):
-        return step_number in steps_to_run
-    log.warning(f"Invalid steps_to_run type: {type(steps_to_run)}. Running step {step_number} by default as a fallback.")
-    return True # Fallback, should ideally not be reached with prior checks
+def should_run_step(step_number: int, steps_to_run) -> bool:
+    return parse_steps(steps_to_run).includes(step_number)
+
+
+def _script_chunks_folder(config: PipelineConfig) -> Path:
+    if config.script_chunks_in_final_folder:
+        return config.get_full_path("final_folderName") / config.script_chunks_folderName
+    return config.base_path / config.script_chunks_folderName
+
+
+def step_output_paths(config: PipelineConfig, step: int) -> List[Path]:
+    final = config.get_full_path("final_folderName")
+    table = {
+        1: [config.get_full_path("chunks_audio_folderName"), final / config.merged_audio_filename,
+            final / config.cut_points_filename],
+        2: [config.get_full_path("whisperx_output_folderName")] if config.run_whisperx else [],
+        3: [config.get_full_path("corrected_json_folderName")],
+        4: [config.get_full_path("srt_folderName")],
+        5: [final / config.merged_transcript_filename],
+        6: [final / config.cleaned_transcript_filename],
+        7: [final / config.final_script_filename],
+        8: [_script_chunks_folder(config)],
+    }
+    return table.get(step, [])
+
+
+def _guard_deletable(config: PipelineConfig, paths: Sequence[Path]) -> None:
+    session = config.base_path.resolve()
+    tracks = config.get_full_path("input_audio_folderName").resolve()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved == session or session not in resolved.parents:
+            raise PipelineError(0, f"Refusing to delete {path}: outside the session folder {session}")
+        if resolved == tracks or tracks in resolved.parents or resolved in tracks.parents:
+            raise PipelineError(0, f"Refusing to delete {path}: overlaps the input tracks folder {tracks}")
+        name = resolved.name.lower()
+        if name.startswith("craig-") and name.endswith(".zip"):
+            raise PipelineError(0, f"Refusing to delete Craig archive {path}")
+
+
+def cleanup_outputs(config: PipelineConfig, first_step: int) -> List[Path]:
+    paths = [p for s in range(first_step, LAST_CLEANUP_STEP + 1) for p in step_output_paths(config, s)]
+    _guard_deletable(config, paths)
+    removed: List[Path] = []
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed.append(path)
+        elif path.exists():
+            path.unlink()
+            removed.append(path)
+    if removed:
+        log.info("Removed previous outputs: " + ", ".join(str(p.relative_to(config.base_path)) for p in removed))
+    return removed
+
+
+def check_step_inputs(config: PipelineConfig, first_step: int) -> None:
+    final = config.get_full_path("final_folderName")
+
+    def need_glob(folder: Path, pattern: str, what: str) -> None:
+        if not folder.is_dir() or not any(folder.glob(pattern)):
+            raise PipelineError(first_step, f"missing input for step {first_step}: no {what} in {folder}")
+
+    def need_file(path: Path) -> None:
+        if not path.is_file():
+            raise PipelineError(first_step, f"missing input for step {first_step}: {path}")
+
+    if first_step == 1:
+        tracks = config.get_full_path("input_audio_folderName")
+        has_archive = any(p.is_file() for p in config.base_path.glob("craig-*.flac.zip"))
+        if not has_archive and not (tracks.is_dir() and any(tracks.glob("*.flac"))):
+            raise PipelineError(1, f"missing input for step 1: no Craig archive and no FLAC in {tracks}")
+    elif first_step == 2:
+        need_glob(config.get_full_path("chunks_audio_folderName"), "*.flac", "chunk FLAC files")
+        need_file(final / config.cut_points_filename)
+        if not config.run_whisperx:
+            need_glob(config.get_full_path("whisperx_output_folderName"), "*.json", "WhisperX JSON files")
+    elif first_step == 3:
+        need_glob(config.get_full_path("whisperx_output_folderName"), "*.json", "WhisperX JSON files")
+    elif first_step == 4:
+        need_glob(config.get_full_path("corrected_json_folderName"), "*.json", "corrected JSON files")
+    elif first_step == 5:
+        need_glob(config.get_full_path("srt_folderName"), "*.srt", "SRT files")
+        need_file(final / config.cut_points_filename)
+    elif first_step == 6:
+        need_file(final / config.merged_transcript_filename)
+    elif first_step == 7:
+        need_file(final / config.cleaned_transcript_filename)
+    else:
+        need_file(final / config.final_script_filename)
+
+
+def expected_chunk_stems(config: PipelineConfig) -> List[str]:
+    if config.run_whisperx:
+        folder, pattern = config.get_full_path("chunks_audio_folderName"), "*.flac"
+    else:
+        folder, pattern = config.get_full_path("whisperx_output_folderName"), "*.json"
+    stems = sorted(p.stem for p in folder.glob(pattern)) if folder.is_dir() else []
+    if not stems:
+        raise PipelineError(2, f"no chunk items found in {folder}")
+    return stems
+
+
+def check_coverage(step: int, folder: Path, expected: Sequence[str], suffix: str) -> None:
+    found = {p.stem for p in folder.glob(f"*{suffix}")} if folder.is_dir() else set()
+    missing = sorted(set(expected) - found)
+    extra = sorted(found - set(expected))
+    if missing or extra:
+        raise PipelineError(step, f"{folder.name}: missing {missing[:10]}; unexpected {extra[:10]}")
+
+
+_TAG_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def _speakers_with_speech(json_folder: Path) -> Set[str]:
+    speaking: Set[str] = set()
+    for path in json_folder.glob("*.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for seg in data.get("segments", []):
+            text = str(seg.get("text") or "").strip()
+            if not text and isinstance(seg.get("words"), list):
+                text = " ".join(str(w.get("word", "")).strip() for w in seg["words"] if isinstance(w, dict)).strip()
+            if text:
+                speaking.add(path.stem.rsplit("-", 1)[0])
+                break
+    return speaking
+
+
+def check_final_script(config: PipelineConfig, expected: Sequence[str], speakers: Optional[SpeakerConfig]) -> None:
+    script = config.get_full_path("final_folderName") / config.final_script_filename
+    text = script.read_text(encoding="utf-8") if script.is_file() else ""
+    if not text.strip():
+        raise PipelineError(7, f"final script is empty: {script}")
+    allowed = {stem.rsplit("-", 1)[0] for stem in expected}
+    if speakers is not None and not allowed <= speakers.tags:
+        raise PipelineError(7, f"chunk speakers {sorted(allowed - speakers.tags)} are not mapped Tags")
+    found = {m.group(1) for line in text.splitlines() if (m := _TAG_RE.match(line))}
+    unexpected = found - allowed
+    if unexpected:
+        raise PipelineError(7, f"unexpected tags in final script: {sorted(unexpected)}")
+    missing = _speakers_with_speech(config.get_full_path("corrected_json_folderName")) - found
+    if missing:
+        raise PipelineError(7, f"speakers with transcribed speech missing from the script: {sorted(missing)}")
+
+
+def _git_commit() -> Optional[str]:
+    try:
+        proc = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+        return proc.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def write_completion_marker(config: PipelineConfig, steps: StepRange, started: datetime, finished: datetime) -> Path:
+    marker = config.get_full_path("final_folderName") / DONE_MARKER_NAME
+    payload = {
+        "steps": [steps.first, steps.last],
+        "whisperx_model": config.whisperx_model,
+        "whisperx_language": config.whisperx_language,
+        "started": started.isoformat(timespec="seconds"),
+        "finished": finished.isoformat(timespec="seconds"),
+        "code_commit": _git_commit(),
+    }
+    tmp = marker.with_name(marker.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, marker)
+    return marker
+
+
+@contextmanager
+def session_log_file(session_path: Path, level: int) -> Iterator[Path]:
+    """Write the session's log to pipeline.log at INFO or more verbose, whatever the console level."""
+    path = session_path / LOG_FILE_NAME
+    file_level = min(level, logging.INFO)
+    handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+    handler.setLevel(file_level)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                                           datefmt="%Y-%m-%d %H:%M:%S"))
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(min(previous_level, file_level) if previous_level else file_level)
+    root.addHandler(handler)  # the console handler keeps its own (possibly higher) level
+    try:
+        yield path
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+        handler.close()
 
 def _setup_logger(level: str) -> None:
     """Configure the root logger for the application."""
@@ -303,61 +537,40 @@ def run_whisperx_docker(
 
 # --- Main Pipeline Function ---
 
+def _run_step(number: int, title: str, fn):
+    log.info(f"=== Step {number}: {title} ===")
+    try:
+        result = fn()
+    except PipelineError:
+        raise
+    except Exception as e:
+        log.exception(f"Step {number} ({title}) failed")
+        raise PipelineError(number, f"{title}: {e}") from e
+    log.info(f"--- Step {number} completed ---")
+    return result
+
+
 def run_pipeline(
-    base_path: str = ".", # Can be relative or absolute string
-    steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 10), # Default runs steps 1-9
+    base_path: str = ".",
+    steps_to_run=None,
     log_level: str = "INFO",
     run_whisperx: bool = True,
     diarize: bool = False,
-    use_low_ram: bool = True,
-    input_audio_folderName: Optional[str] = None, # Override default "tracks"
-    # File chunking parameters
-    script_chunk_size: Optional[int] = None,  # Number of lines per chunk
-    script_chunk_filename_template: Optional[str] = None,  # Filename template for chunks
-    script_chunks_in_final_folder: Optional[bool] = None,  # Whether to put chunks inside final_outputs/
-    script_chunks_folderName: Optional[str] = None,  # Custom folder name for chunks
-    script_chunks_compact_mode: Optional[bool] = None,  # Remove extra blank lines for compact chunks
-    # Allow passing a dict to override specific LLMConfig fields, or a full LLMConfig object
+    input_audio_folderName: Optional[str] = None,
+    script_chunk_size: Optional[int] = None,
+    script_chunk_filename_template: Optional[str] = None,
+    script_chunks_in_final_folder: Optional[bool] = None,
+    script_chunks_folderName: Optional[str] = None,
+    script_chunks_compact_mode: Optional[bool] = None,
     llm_config_overrides: Optional[Union[Dict[str, Any], LLMConfig]] = None,
-    config_obj: Optional[PipelineConfig] = None, # Pass a full pre-configured PipelineConfig
-    **kwargs: Any # For other PipelineConfig overrides by keyword
-    ) -> None:
-    """
-    Run the audio transcription and processing pipeline.
-
-    Allows setting key parameters directly or passing a full config object.
-    Direct arguments override values in config_obj or defaults. Kwargs override direct args.
-
-    Args:
-        base_path: Base directory for the session. Default: current directory.
-        steps_to_run: 1-based steps to run (slice, list, or tuple). Default runs 1-9.
-        log_level: Logging level ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL').
-        run_whisperx: Whether to run the WhisperX Docker step automatically.
-        diarize: Enable speaker diarization in WhisperX (requires Hugging Face token).
-        use_low_ram: Use low RAM mode for audio chunking (pydub).
-        input_audio_folderName: Optional override for the input tracks folder name.
-        
-        # File chunking parameters (Step 9):
-        script_chunk_size: Number of lines per chunk. Default: 1000.
-        script_chunk_filename_template: Filename template for chunks. Default: "script_chunk_{:02d}.txt".
-        script_chunks_in_final_folder: If True, chunks go inside final_outputs/. Default: True.
-        script_chunks_folderName: Custom folder name for chunks. Default: "script_chunks".
-        script_chunks_compact_mode: Remove extra blank lines for compact chunks. Default: True.
-        
-        llm_config_overrides: Optional dict or LLMConfig object to override LLM settings.
-        config_obj: An optional pre-configured PipelineConfig object.
-        **kwargs: Additional configuration overrides matching PipelineConfig attributes.
-    """
-    _setup_logger(log_level) # Configure logging as the first step
-
-    # __version__ might not be globally defined if not installed as a package
-    try: version_info = __version__
-    except NameError: version_info = "unknown"
-    log.info(f"Initializing chronicleweave pipeline (v{version_info})...")
-
+    config_obj: Optional[PipelineConfig] = None,
+    **kwargs: Any,
+) -> None:
+    """Run the pipeline for one session. Raises PipelineError on any failure."""
+    _setup_logger(log_level)
     explicit_kwargs = {
-        "steps_to_run": steps_to_run, "log_level": log_level,
-        "run_whisperx": run_whisperx, "diarize": diarize, "use_low_ram": use_low_ram,
+        "steps_to_run": parse_steps(steps_to_run) if steps_to_run is not None else None,
+        "log_level": log_level, "run_whisperx": run_whisperx, "diarize": diarize,
         "input_audio_folderName": input_audio_folderName,
         "script_chunk_size": script_chunk_size,
         "script_chunk_filename_template": script_chunk_filename_template,
@@ -365,266 +578,92 @@ def run_pipeline(
         "script_chunks_folderName": script_chunks_folderName,
         "script_chunks_compact_mode": script_chunks_compact_mode,
     }
-    config = _build_pipeline_config(
-        config_obj=config_obj,
-        base_path=base_path,
-        explicit_kwargs=explicit_kwargs,
-        llm_config_overrides=llm_config_overrides,
-        extra_kwargs=kwargs,
-    )
+    config = _build_pipeline_config(config_obj, base_path, explicit_kwargs, llm_config_overrides, kwargs)
+    steps = parse_steps(config.steps_to_run)
     config.base_path.mkdir(parents=True, exist_ok=True)
-
-    log.info("Effective configuration applied.")
-    if config.log_level == "DEBUG":
-        # Use the __str__ method for a safer representation in logs
-        log.debug(f"Full effective configuration: {config}")
-
-
-    # Define paths using the final config
-    input_audio_folder = config.get_full_path("input_audio_folderName")
-    chunked_audio_folder = config.get_full_path("chunks_audio_folderName")
-    whisperx_output_folder = config.get_full_path("whisperx_output_folderName")
-    corrected_json_folder = config.get_full_path("corrected_json_folderName")
-    srt_folder = config.get_full_path("srt_folderName")
-    final_folder = config.get_full_path("final_folderName") # Main output for final user-facing files
-    
-    # Script chunks folder placement is conditional
-    if config.script_chunks_in_final_folder:
-        script_chunks_folder = final_folder / config.script_chunks_folderName
-    else:
-        script_chunks_folder = config.base_path / config.script_chunks_folderName
-
-    # Specific file paths within the final_folder
-    merged_file_path = final_folder / config.merged_audio_filename
-    cut_points_file_path = final_folder / config.cut_points_filename
-    merged_srt_path = final_folder / config.merged_transcript_filename
-    cleaned_srt_path = final_folder / config.cleaned_transcript_filename
-    final_script_path = final_folder / config.final_script_filename
-
-    # Create final output folder early (if it's different from base_path)
-    try:
-        final_folder.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        log.exception(f"Failed creating final output directory: {final_folder}")
-        raise IOError(f"Could not create final output directory {final_folder}") from e
-
-    # --- Input/Output Path Collision Check ---
-    if input_audio_folder.resolve() == final_folder.resolve():
-         log.warning(f"Input audio folder ('{input_audio_folder.name}') and final output folder ('{final_folder.name}') "
-                     f"resolve to the same path: {input_audio_folder.resolve()}. "
-                     "This might lead to data overwrites or unexpected behavior if not intended.")
-    # More specific checks can be added if intermediate folders might collide dangerously.
-
-    steps_executed: List[int] = []
-    pipeline_successful = True # Assume success until a step fails critically
-
-    # --- Step Execution ---
-    # Step 0: Prepare tracks (auto-unzip Craig archive + apply speaker mapping)
-    # Idempotent: skipped silently when already done. Tied to Step 1 so it only
-    # runs when chunking would also run.
-    if config.auto_prepare_tracks and should_run_step(1, config.steps_to_run):
-        log.info("=== Step 0: Preparing tracks (unzip + speaker rename) ===")
+    level = getattr(logging, str(config.log_level).upper(), logging.INFO)
+    with session_log_file(config.base_path, level):
         try:
-            prepare_tracks(
-                session_path=config.base_path,
-                speakers=speaker_config_from_env(),
-                tracks_folder_name=config.input_audio_folderName,
-            )
-        except Exception:
-            # Non-critical: if this fails, the user can still run the manual flow.
-            log.exception("!!! Step 0 (Prepare Tracks) FAILED (Non-Critical) !!!")
+            _run_steps(config, steps)
+        except PipelineError as e:
+            log.error(f"Pipeline FAILED for {config.base_path.name}: {e}")
+            raise
 
-    # Step 1: Chunking Audio
-    if should_run_step(1, config.steps_to_run):
-        log.info("=== Step 1: Chunking audio tracks ===")
-        try:
-            if not input_audio_folder.is_dir():
-                raise FileNotFoundError(f"Input audio directory '{input_audio_folder}' not found.")
-            chunk_audio(
-                input_folder=input_audio_folder, output_dir=chunked_audio_folder,
-                merged_file=merged_file_path, cut_points_file=cut_points_file_path,
-                config=config.chunking_config
-            )
-            steps_executed.append(1); log.info("--- Step 1 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 1 (Chunking Audio) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return # Halt pipeline on critical failure
 
-    # Step 2: WhisperX Transcription
-    if should_run_step(2, config.steps_to_run):
-        log.info("=== Step 2: WhisperX transcription ===")
-        try:
-            if config.run_whisperx:
-                # Pass session_path (which is config.base_path) and the name of the chunks folder
-                run_whisperx_docker(config.base_path, config.chunks_audio_folderName, config)
-            else:
-                log.warning("run_whisperx is False. Manual transcription step required.")
-                log.warning(f"Ensure JSON outputs from WhisperX (for chunks in '{config.chunks_audio_folderName}/') "
-                            f"are placed in '{config.whisperx_output_folderName}/' relative to {config.base_path}.")
-                # Basic check for outputs after manual step
-                if not whisperx_output_folder.is_dir() or not any(whisperx_output_folder.iterdir()):
-                    log.error(f"WhisperX output directory '{whisperx_output_folder}' is empty or missing after expected manual step.")
-                    raise FileNotFoundError(f"WhisperX output dir '{whisperx_output_folder}' empty/missing after manual step.")
-            steps_executed.append(2); log.info("--- Step 2 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 2 (WhisperX Transcription) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
+def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
+    started = datetime.now()
+    final = config.get_full_path("final_folderName")
+    tracks = config.get_full_path("input_audio_folderName")
+    chunks = config.get_full_path("chunks_audio_folderName")
+    wx = config.get_full_path("whisperx_output_folderName")
+    jsons = config.get_full_path("corrected_json_folderName")
+    srts = config.get_full_path("srt_folderName")
+    cut_points = final / config.cut_points_filename
+    merged_srt = final / config.merged_transcript_filename
+    cleaned_srt = final / config.cleaned_transcript_filename
+    script = final / config.final_script_filename
+    log.info(f"Session {config.base_path} — steps {steps.first}-{steps.last}, model {config.whisperx_model}")
 
-    # Step 3: Correcting WhisperX Output
-    if should_run_step(3, config.steps_to_run):
-        log.info("=== Step 3: Correcting WhisperX output ===")
-        try:
-            if not whisperx_output_folder.is_dir():
-                raise FileNotFoundError(f"WhisperX output directory '{whisperx_output_folder}' for correction not found.")
-            correct_whisperx_outputs(
-                input_dir=whisperx_output_folder, output_dir=corrected_json_folder,
-                overwrite=True, config=config.corrector_config
-            )
-            steps_executed.append(3); log.info("--- Step 3 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 3 (Correcting WhisperX) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
+    if steps.first <= LAST_CLEANUP_STEP:
+        check_step_inputs(config, steps.first)
+        marker = final / DONE_MARKER_NAME
+        if steps.first <= 7 and marker.exists():
+            marker.unlink()  # the final script is about to be rebuilt
+        cleanup_outputs(config, steps.first)
+    final.mkdir(parents=True, exist_ok=True)
 
-    # Step 4: Converting Corrected JSON to SRT
-    if should_run_step(4, config.steps_to_run):
-        log.info("=== Step 4: Converting corrected JSON to SRT ===")
-        try:
-            if not corrected_json_folder.is_dir():
-                raise FileNotFoundError(f"Corrected JSON directory '{corrected_json_folder}' for SRT conversion not found.")
-            convert_json_folder_to_srt(input_dir=corrected_json_folder, output_dir=srt_folder)
-            steps_executed.append(4); log.info("--- Step 4 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 4 (JSON to SRT) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
+    speakers = config.speakers
+    if speakers is None and (steps.includes(1) or steps.includes(7)):
+        # needed for step 0 and for the step-7 gate; a missing CW_SPEAKERS fails here, logged
+        speakers = _run_step(0, "Reading speaker configuration", speaker_config_from_env)
+    if steps.includes(1):
+        _run_step(0, "Preparing tracks", lambda: prepare_tracks(
+            config.base_path, speakers, config.input_audio_folderName, rename=config.auto_prepare_tracks))
+        _run_step(1, "Chunking audio", lambda: chunk_audio(
+            tracks, chunks, final / config.merged_audio_filename, cut_points, config.chunking_config))
 
-    # Step 5: Merging SRT files by chunk
-    if should_run_step(5, config.steps_to_run):
-        log.info("=== Step 5: Merging SRT files by chunk ===")
-        try:
-            if not srt_folder.is_dir():
-                raise FileNotFoundError(f"SRT directory '{srt_folder}' for merging not found.")
-            merge_srt_by_chunk(
-                srt_folder=srt_folder, output_dir=final_folder, # Merged SRT goes to final_outputs
-                output_filename=config.merged_transcript_filename,
-                cut_points_file=cut_points_file_path
-            )
-            steps_executed.append(5); log.info("--- Step 5 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 5 (Merging SRTs) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
+    def transcribe():
+        if config.run_whisperx:
+            run_whisperx_docker(config.base_path, config.chunks_audio_folderName, config)
+        check_coverage(2, wx, expected_chunk_stems(config), ".json")
 
-    # Step 6: Merging successive speaker entries
-    if should_run_step(6, config.steps_to_run):
-        log.info("=== Step 6: Merging successive speaker entries ===")
-        try:
-            if not merged_srt_path.is_file():
-                raise FileNotFoundError(f"Merged SRT file '{merged_srt_path}' for speaker merging not found.")
-            merge_speaker_entries(input_srt_file=merged_srt_path, output_srt_file=cleaned_srt_path)
-            steps_executed.append(6); log.info("--- Step 6 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 6 (Merging Speaker Entries) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
+    if steps.includes(2):
+        _run_step(2, "WhisperX transcription", transcribe)
+    if steps.includes(3):
+        def correct():
+            correct_whisperx_outputs(wx, jsons, overwrite=True, config=config.corrector_config)
+            check_coverage(3, jsons, expected_chunk_stems(config), ".json")
+        _run_step(3, "Correcting WhisperX output", correct)
+    if steps.includes(4):
+        def to_srt():
+            convert_json_folder_to_srt(input_dir=jsons, output_dir=srts)
+            check_coverage(4, srts, expected_chunk_stems(config), ".srt")
+        _run_step(4, "Converting JSON to SRT", to_srt)
+    if steps.includes(5):
+        _run_step(5, "Merging SRT files by chunk", lambda: merge_srt_by_chunk(
+            srt_folder=srts, output_dir=final, output_filename=config.merged_transcript_filename,
+            cut_points_file=cut_points))
+    if steps.includes(6):
+        _run_step(6, "Merging successive speaker entries", lambda: merge_speaker_entries(
+            input_srt_file=merged_srt, output_srt_file=cleaned_srt))
+    if steps.includes(7):
+        def write_script():
+            srt_to_script(input_srt_path=cleaned_srt, output_script_path=script)
+            check_final_script(config, expected_chunk_stems(config), speakers)
+        _run_step(7, "Creating final script", write_script)
+    if steps.includes(8):
+        def chunk_script():
+            folder = _script_chunks_folder(config)
+            folder.mkdir(parents=True, exist_ok=True)
+            chunk_text_file_by_lines(input_file=script, output_dir=folder,
+                                     chunk_size=config.script_chunk_size,
+                                     output_filename_template=config.script_chunk_filename_template,
+                                     compact_mode=config.script_chunks_compact_mode)
+        _run_step(8, "Chunking final script", chunk_script)
+    if steps.includes(9):
+        _run_step(9, "LLM processing", lambda: process_with_llm(
+            final_script_file=script, output_dir=final, llm_config=config.llm_config, pipeline_config=config))
 
-    # Step 7: Creating final readable script
-    if should_run_step(7, config.steps_to_run):
-        log.info("=== Step 7: Creating final readable script ===")
-        try:
-            if not cleaned_srt_path.is_file():
-                raise FileNotFoundError(f"Cleaned SRT file '{cleaned_srt_path}' for script generation not found.")
-            srt_to_script(input_srt_path=cleaned_srt_path, output_script_path=final_script_path)
-            steps_executed.append(7); log.info("--- Step 7 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 7 (SRT to Script) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
-
-   
-
-    # Step 8: Chunking Final Script
-    if should_run_step(8, config.steps_to_run):
-        log.info("=== Step 8: Chunking final script ===")
-        try:
-            if not final_script_path.is_file():
-                raise FileNotFoundError(f"Final script file '{final_script_path}' for chunking not found.")
-            
-            # Create script chunks directory
-            try:
-                script_chunks_folder.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                log.exception(f"Failed creating script chunks directory: {script_chunks_folder}")
-                raise IOError(f"Could not create script chunks directory {script_chunks_folder}") from e
-            
-            # Chunk the final script
-            chunked_files = chunk_text_file_by_lines(
-                input_file=final_script_path,
-                output_dir=script_chunks_folder,
-                chunk_size=config.script_chunk_size,
-                output_filename_template=config.script_chunk_filename_template,
-                compact_mode=config.script_chunks_compact_mode
-            )
-            
-            log.info(f"Successfully created {len(chunked_files)} script chunks in {script_chunks_folder}")
-            steps_executed.append(8)
-            log.info("--- Step 8 completed ---")
-        except Exception as e:
-            log.exception("!!! Step 8 (Script Chunking) FAILED CRITICALLY !!!")
-            pipeline_successful = False
-        if not pipeline_successful: return
-
-     # Step 9: LLM Processing
-    if should_run_step(9, config.steps_to_run):
-        log.info("=== Step 9: LLM Processing (Summary/Narrative Generation) ===")
-        try:
-            if not final_script_path.is_file():
-                raise FileNotFoundError(f"Final script file '{final_script_path}' for LLM processing not found.")
-            
-            process_with_llm(
-                final_script_file=final_script_path,
-                output_dir=final_folder, # LLM outputs also go to final_folder
-                llm_config=config.llm_config,
-                pipeline_config=config # Pass the full pipeline_config for context
-            )
-            steps_executed.append(9)
-            log.info("--- Step 9 completed ---")
-        except Exception as e:
-            # LLM processing failure is logged as an error but considered non-critical for the overall pipeline result
-            # if other primary transcription steps succeeded.
-            log.exception("!!! Step 9 (LLM Processing) FAILED (Non-Critical) !!!")
-            log.warning("LLM processing step encountered an error. Pipeline will continue if prior steps were successful.")
-            # pipeline_successful is not set to False here to allow main pipeline to be "successful"
-            # if only the LLM part fails. This behavior can be changed if LLM is critical.
-        # No 'if not pipeline_successful: return' here for LLM step by design (non-critical)
-
-    # --- Final Summary ---
-    log.info("========================================")
-    if pipeline_successful:
-        # Determine what was requested vs. what ran
-        all_possible_steps = list(range(1, 10)) # Steps 1 through 9
-        requested_steps_list: List[int] = []
-        if isinstance(config.steps_to_run, slice):
-            start, stop, step_val = config.steps_to_run.indices(10) # Max steps is 10 (for 1-9)
-            requested_steps_list = list(range(max(1, start), stop, step_val))
-        elif isinstance(config.steps_to_run, (list, tuple)):
-            requested_steps_list = [s for s in config.steps_to_run if 1 <= s <= 9]
-        
-        if set(steps_executed) == set(requested_steps_list):
-            if set(steps_executed) == set(all_possible_steps):
-                log.info(f"✅ Full pipeline (steps {steps_executed}) finished successfully!")
-            else:
-                log.info(f"✅ Requested pipeline steps {steps_executed} finished successfully!")
-        else:
-            # This might happen if LLM step failed (but was non-critical) or if some requested steps were skipped internally.
-            log.warning(f"Pipeline finished. Executed steps: {steps_executed}. Requested steps: {requested_steps_list}. "
-                        "Some requested steps may not have run or an optional step (like LLM) may have failed.")
-        log.info(f"Find outputs in: {final_folder.resolve()}")
-        log.info(f"Find script chunks in: {script_chunks_folder.resolve()}")
-    else:
-        log.error(f"☠️ Pipeline FAILED after executing steps: {steps_executed}. Check logs for critical errors.")
-        # Re-raise a generic error to signal failure to the caller if used programmatically
-        raise RuntimeError("chronicleweave pipeline failed during execution.")
+    if steps.last >= 7 and steps.first <= 7:
+        write_completion_marker(config, steps, started, datetime.now())
+    log.info(f"Steps {steps.first}-{steps.last} finished successfully for {config.base_path.name}.")

@@ -1,28 +1,22 @@
 # tests/test_pipeline_e2e.py
-"""End-to-end smoke test for the chronicleweave pipeline.
+"""End-to-end tests for the chronicleweave pipeline.
 
 Builds a synthetic session: one Craig zip → tracks → fake WhisperX JSON →
 final script. Mocks the WhisperX Docker step (no GPU/Docker in CI) by writing
-the JSON outputs directly. Catches wiring regressions across stages."""
+the JSON outputs directly. Covers run control: completion marker, session log,
+failure propagation, clean re-runs and an explicitly requested step 9."""
 
 import json
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
 import pytest
 from pydub import AudioSegment
 
-from chronicleweave.pipeline import run_pipeline
+from chronicleweave.pipeline import DONE_MARKER_NAME, PipelineError, run_pipeline
 
 pytestmark = pytest.mark.slow
-
-
-def _silent_flac(path: Path, duration_ms: int = 2000) -> None:
-    """Write a tiny silent FLAC. Two seconds is enough for the chunker
-    to treat the whole file as a single chunk."""
-    AudioSegment.silent(duration=duration_ms, frame_rate=16000).export(path, format="flac")
 
 
 def _make_craig_zip(target: Path, speakers: dict) -> None:
@@ -69,86 +63,89 @@ def _fake_whisperx(session_path: Path, chunks_folder_name: str, config) -> None:
         }))
 
 
+SPEAKERS_ENV = {"CW_SPEAKERS": "player_one:Titar,gamemaster:GM", "CW_IGNORE_TRACKS": "Spoticord"}
+
+
 @pytest.fixture
-def synthetic_session(tmp_path: Path) -> Path:
+def synthetic_session(tmp_path, monkeypatch):
+    for k, v in SPEAKERS_ENV.items():
+        monkeypatch.setenv(k, v)
     session = tmp_path / "session_test"
     session.mkdir()
-    silence = AudioSegment.silent(duration=2000, frame_rate=16000)
+    speech = AudioSegment.silent(duration=2000, frame_rate=16000)
     _make_craig_zip(session / "craig-FAKE12345.flac.zip", {
-        "player_one": silence,
-        "gamemaster": silence,
+        "player_one": speech, "gamemaster": speech, "Spoticord_Music_4270": speech,
     })
     return session
 
 
-def test_e2e_steps_1_to_7_produces_final_script(synthetic_session, monkeypatch):
-    """
-    Run the full transcription chain (steps 1-7) on a synthetic session.
-    Verifies: prepare_tracks → chunking → (faked) WhisperX → SRT → script,
-    with the speaker mapping applied so the final script tags Titar/GM,
-    not the raw Discord usernames.
-    """
-    # Mock the docker call only.
+def _run(session, **kw):
     with patch("chronicleweave.pipeline.run_whisperx_docker", side_effect=_fake_whisperx):
-        run_pipeline(
-            base_path=str(synthetic_session),
-            steps_to_run=[1, 2, 3, 4, 5, 6, 7],
-            run_whisperx=True,  # uses our patched docker fn
-            log_level="WARNING",
-        )
-
-    final = synthetic_session / "final_outputs" / "final_script.txt"
-    assert final.is_file(), "final_script.txt was not produced"
-    text = final.read_text(encoding="utf-8")
-
-    # Speaker mapping was applied (Step 0): raw Craig usernames replaced.
-    assert "[Titar]" in text or "Titar" in text, f"Expected mapped speaker Titar in:\n{text}"
-    assert "[GM]" in text or "GM" in text, f"Expected mapped speaker GM in:\n{text}"
-    # Raw usernames must NOT leak into the final script.
-    assert "player_one" not in text
-    assert "gamemaster" not in text
+        run_pipeline(base_path=str(session), steps_to_run="1-7", log_level="WARNING", **kw)
 
 
-def test_e2e_no_prepare_keeps_raw_names(synthetic_session, monkeypatch):
-    """With auto_prepare_tracks=False the user must extract themselves;
-    if they do but skip mapping, raw stems propagate to the script."""
-    # Manually unzip without mapping.
+def test_e2e_steps_1_to_7(synthetic_session):
+    _run(synthetic_session)
+    text = (synthetic_session / "final_outputs" / "final_script.txt").read_text(encoding="utf-8")
+    assert "[Titar]" in text and "[GM]" in text
+    assert "player_one" not in text and "Spoticord" not in text
+    marker = json.loads((synthetic_session / "final_outputs" / DONE_MARKER_NAME).read_text())
+    assert marker["steps"] == [1, 7] and marker["whisperx_model"] == "large-v3"
+    assert (synthetic_session / "pipeline.log").read_text(encoding="utf-8")
+
+
+def test_e2e_failure_raises_and_writes_no_marker(synthetic_session):
+    def broken(*a, **k):
+        raise RuntimeError("docker exploded")
+    with patch("chronicleweave.pipeline.run_whisperx_docker", side_effect=broken):
+        with pytest.raises(PipelineError):
+            run_pipeline(base_path=str(synthetic_session), steps_to_run="1-7", log_level="WARNING")
+    assert not (synthetic_session / "final_outputs" / DONE_MARKER_NAME).exists()
+    assert "docker exploded" in (synthetic_session / "pipeline.log").read_text(encoding="utf-8")
+
+
+def test_e2e_no_prepare_with_raw_names_fails(synthetic_session):
     import zipfile as _zf
     archive = next(synthetic_session.glob("craig-*.flac.zip"))
     tracks = synthetic_session / "tracks"
     tracks.mkdir()
     with _zf.ZipFile(archive) as zf:
-        for m in zf.namelist():
-            if m.endswith(".flac"):
-                zf.extract(m, tracks)
-
-    with patch("chronicleweave.pipeline.run_whisperx_docker", side_effect=_fake_whisperx):
-        run_pipeline(
-            base_path=str(synthetic_session),
-            steps_to_run=[1, 2, 3, 4, 5, 6, 7],
-            run_whisperx=True,
-            log_level="WARNING",
-            auto_prepare_tracks=False,
-        )
-
-    text = (synthetic_session / "final_outputs" / "final_script.txt").read_text()
-    # Raw stems leak through when prep is disabled — proves prepare_tracks is doing real work.
-    assert "player_one" in text or "1-player_one" in text
+        zf.extract("1-player_one.flac", tracks)
+    with pytest.raises(PipelineError):
+        _run(synthetic_session, auto_prepare_tracks=False)
 
 
-def test_e2e_idempotent_rerun(synthetic_session):
-    """Running the pipeline twice must not crash and must produce the same final output."""
-    with patch("chronicleweave.pipeline.run_whisperx_docker", side_effect=_fake_whisperx):
-        run_pipeline(
-            base_path=str(synthetic_session),
-            steps_to_run=[1, 2, 3, 4, 5, 6, 7],
-            run_whisperx=True, log_level="WARNING",
-        )
-        first = (synthetic_session / "final_outputs" / "final_script.txt").read_text()
-        run_pipeline(
-            base_path=str(synthetic_session),
-            steps_to_run=[1, 2, 3, 4, 5, 6, 7],
-            run_whisperx=True, log_level="WARNING",
-        )
-        second = (synthetic_session / "final_outputs" / "final_script.txt").read_text()
-    assert first == second
+def test_rerun_after_partial_outputs_starts_clean(synthetic_session):
+    _run(synthetic_session)
+    (synthetic_session / "wx_output" / "Ghost-01.json").write_text("{}")  # stale leftover
+    (synthetic_session / "final_outputs" / DONE_MARKER_NAME).unlink()
+    _run(synthetic_session)
+    assert not (synthetic_session / "wx_output" / "Ghost-01.json").exists()
+    assert (synthetic_session / "final_outputs" / DONE_MARKER_NAME).exists()
+
+
+def test_rerun_with_new_transcripts_uses_new_text(synthetic_session):
+    _run(synthetic_session)
+
+    def other_text(session_path, chunks_folder_name, config):
+        _fake_whisperx(session_path, chunks_folder_name, config)
+        for p in (session_path / config.whisperx_output_folderName).glob("*.json"):
+            p.write_text(p.read_text().replace("hello", "THIRD"))  # in text AND words (step 3 rebuilds from words)
+
+    with patch("chronicleweave.pipeline.run_whisperx_docker", side_effect=other_text):
+        run_pipeline(base_path=str(synthetic_session), steps_to_run="2-7", log_level="WARNING")
+    text = (synthetic_session / "final_outputs" / "final_script.txt").read_text(encoding="utf-8")
+    assert "THIRD" in text and "hello" not in text
+
+
+def test_step9_requested_failure_raises(synthetic_session, monkeypatch):
+    _run(synthetic_session)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(PipelineError, match="Step 9"):
+        run_pipeline(base_path=str(synthetic_session), steps_to_run="9", log_level="WARNING")
+
+
+def test_step8_only_rerun_keeps_marker(synthetic_session):
+    _run(synthetic_session)
+    run_pipeline(base_path=str(synthetic_session), steps_to_run="8", log_level="WARNING")
+    assert (synthetic_session / "final_outputs" / DONE_MARKER_NAME).exists()
