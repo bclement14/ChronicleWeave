@@ -168,10 +168,6 @@ Examples:
         action="store_true",
         help="Skip auto-unzip of Craig archive and speaker renaming (Step 0)"
     )
-    parser.add_argument(
-        "--mapping-file",
-        help="Path to a custom speaker mapping JSON (default: packaged speaker_mapping.json)"
-    )
 
     # Verbose output
     parser.add_argument(
@@ -226,8 +222,6 @@ def main():
 
     if args.no_prepare_tracks:
         pipeline_kwargs["auto_prepare_tracks"] = False
-    if args.mapping_file:
-        pipeline_kwargs["speaker_mapping_path"] = Path(args.mapping_file)
     if args.whisperx_model:
         pipeline_kwargs["whisperx_model"] = args.whisperx_model
     if args.whisperx_language:

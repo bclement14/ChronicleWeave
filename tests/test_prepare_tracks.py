@@ -1,260 +1,215 @@
 # tests/test_prepare_tracks.py
-
-import json
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from chronicleweave.modules.prepare_tracks import (
-    DEFAULT_MAPPING_PATH,
-    SpeakerRule,
-    apply_speaker_mapping,
-    load_speaker_mapping,
+    PrepareResult,
+    SpeakerConfig,
+    TrackPreparationError,
+    classify_track,
+    find_craig_archive,
+    parse_speaker_config,
     prepare_tracks,
-    resolve_display_name,
-    unzip_craig_archive,
-    _username_from_track,
+    speaker_config_from_env,
+    username_from_track,
 )
 
-
-# --- Fixtures ---
-
-@pytest.fixture
-def rules() -> list:
-    return [
-        SpeakerRule(match="player_one", name="Titar"),
-        SpeakerRule(match="gamemaster", name="GM"),
-        SpeakerRule(match="pen", name="Pen"),
-        SpeakerRule(match="player_three", name="Khalebe"),
-        SpeakerRule(match="playerfour", name="Kashkyst"),
-    ]
+SPEAKERS = "player_one:Titar,gamemaster:GM,penny42:Pen,player_three:Khalebe,playerfour:Kashkyst"
 
 
 @pytest.fixture
-def mapping_file(tmp_path: Path) -> Path:
-    p = tmp_path / "mapping.json"
-    p.write_text(json.dumps({
-        "mappings": [
-            {"match": "player_one", "name": "Titar"},
-            {"match": "gamemaster", "name": "GM"},
-            {"match": "pen", "name": "Pen"},
-            {"match": "player_three", "name": "Khalebe"},
-            {"match": "playerfour", "name": "Kashkyst"},
-        ]
-    }), encoding="utf-8")
-    return p
+def cfg() -> SpeakerConfig:
+    return parse_speaker_config(SPEAKERS, "Spoticord")
 
 
-def _make_zip(target: Path, members: dict) -> Path:
-    """Create a zip with given {name: bytes} members. Returns target path."""
-    with zipfile.ZipFile(target, "w") as zf:
-        for name, payload in members.items():
-            zf.writestr(name, payload)
-    return target
+def _zip(session: Path, entries: dict, name: str = "craig-ABC.flac.zip") -> Path:
+    path = session / name
+    with zipfile.ZipFile(path, "w") as zf:
+        for entry, payload in entries.items():
+            zf.writestr(entry, payload)
+        zf.writestr("info.txt", "meta")
+        zf.writestr("raw.dat", b"\x00")
+    return path
 
 
-# --- _username_from_track ---
+# --- parsing ---
 
-@pytest.mark.parametrize("stem,expected", [
-    ("1-player_one", "player_one"),
-    ("4-_playerfour", "playerfour"),
-    ("12-gamemaster", "gamemaster"),
-    ("plain", "plain"),
-    ("__weird", "weird"),
-])
-def test_username_from_track(stem, expected):
-    assert _username_from_track(stem) == expected
+def test_parse_valid(cfg):
+    assert cfg.speakers["player_one"] == "Titar"
+    assert cfg.ignore == ("spoticord",)
+    assert cfg.tags == frozenset({"Titar", "GM", "Pen", "Khalebe", "Kashkyst"})
 
 
-# --- resolve_display_name ---
-
-def test_resolve_display_name_match(rules):
-    assert resolve_display_name("1-player_one", rules) == "Titar"
-    assert resolve_display_name("5-_playerfour", rules) == "Kashkyst"
-    assert resolve_display_name("3-penny42", rules) == "Pen"
+def test_parse_ignores_whitespace_and_empty_tokens():
+    c = parse_speaker_config(" a:A , ,b:B,", " Spoticord , ,")
+    assert dict(c.speakers) == {"a": "A", "b": "B"}
+    assert c.ignore == ("spoticord",)
 
 
-def test_resolve_display_name_no_match(rules):
-    assert resolve_display_name("99-stranger", rules) is None
+@pytest.mark.parametrize("value", [None, "", "  ", "nocolon", "a:", ":A", "a:A,a:B", "a:Tag,b:tag"])
+def test_parse_invalid_raises(value):
+    with pytest.raises(TrackPreparationError):
+        parse_speaker_config(value, None)
 
 
-def test_resolve_display_name_case_insensitive(rules):
-    assert resolve_display_name("2-GameMaster", rules) == "GM"
+def test_from_env_reads_variables():
+    c = speaker_config_from_env({"CW_SPEAKERS": "x:X", "CW_IGNORE_TRACKS": "bot"})
+    assert dict(c.speakers) == {"x": "X"} and c.ignore == ("bot",)
 
 
-# --- load_speaker_mapping ---
-
-def test_load_speaker_mapping_file(mapping_file):
-    rules = load_speaker_mapping(mapping_file)
-    assert len(rules) == 5
-    assert rules[0] == SpeakerRule(match="player_one", name="Titar")
+def test_from_env_missing_raises():
+    with pytest.raises(TrackPreparationError, match="CW_SPEAKERS"):
+        speaker_config_from_env({})
 
 
-def test_load_speaker_mapping_missing(tmp_path):
-    rules = load_speaker_mapping(tmp_path / "does_not_exist.json")
-    assert rules == []
+# --- classification ---
+
+def test_username_strips_index_and_underscores():
+    assert username_from_track("4-_playerfour") == "playerfour"
+    assert username_from_track("1-player_one") == "player_one"
 
 
-def test_load_speaker_mapping_malformed(tmp_path):
-    p = tmp_path / "bad.json"
-    p.write_text("{not valid json", encoding="utf-8")
-    assert load_speaker_mapping(p) == []
+def test_classify(cfg):
+    assert classify_track("2-Spoticord_Music_4270", cfg) == ("ignored", None)
+    assert classify_track("Titar", cfg) == ("tag", "Titar")
+    assert classify_track("4-_PlayerFour", cfg) == ("mapped", "Kashkyst")
+    assert classify_track("9-stranger", cfg) == ("unknown", None)
 
 
-def test_load_speaker_mapping_skips_bad_entries(tmp_path):
-    p = tmp_path / "mixed.json"
-    p.write_text(json.dumps({
-        "mappings": [
-            {"match": "ok", "name": "Ok"},
-            {"match": "", "name": "Empty"},  # rejected
-            {"match": "missing_name"},        # rejected
-            "not a dict",                      # rejected
-        ]
-    }), encoding="utf-8")
-    rules = load_speaker_mapping(p)
-    assert rules == [SpeakerRule(match="ok", name="Ok")]
+def test_classify_exact_match_not_substring(cfg):
+    # "pen" must not match "penny42"-like substrings any more
+    c = parse_speaker_config("pen:Pen", None)
+    assert classify_track("3-penny42", c) == ("unknown", None)
 
 
-def test_packaged_default_mapping_loads():
-    """Sanity-check that the JSON shipped with the package is well-formed."""
-    rules = load_speaker_mapping(DEFAULT_MAPPING_PATH)
-    assert len(rules) >= 5
-    names = {r.name for r in rules}
-    assert {"Titar", "GM", "Pen", "Khalebe", "Kashkyst"} <= names
+def test_ignore_wins_over_mapping():
+    c = parse_speaker_config("spoticord_music_4270:Music", "Spoticord")
+    assert classify_track("1-Spoticord_Music_4270", c) == ("ignored", None)
 
 
-# --- apply_speaker_mapping ---
+# --- archive discovery ---
 
-def test_apply_speaker_mapping_renames(tmp_path, rules):
+def test_find_archive_first_sorted_and_skips_dirs(tmp_path, caplog):
+    (tmp_path / "craig-AAA.flac").mkdir()  # Windows-extracted folder, not an archive
+    (tmp_path / "craig-ZZZ.flac.zip").write_bytes(b"x")
+    (tmp_path / "craig-BBB.flac.zip").write_bytes(b"x")
+    assert find_craig_archive(tmp_path).name == "craig-BBB.flac.zip"
+    assert "Multiple Craig archives" in caplog.text
+
+
+def test_find_archive_ignores_directory_named_like_archive(tmp_path):
+    (tmp_path / "craig-AAA.flac.zip").mkdir()
+    assert find_craig_archive(tmp_path) is None
+
+
+# --- prepare_tracks ---
+
+def test_extract_rename_and_skip_ignored(tmp_path, cfg):
+    _zip(tmp_path, {"1-player_one.flac": b"aa", "2-Spoticord_Music_4270.flac": b"bb", "3-penny42.flac": b"cc"})
+    result = prepare_tracks(tmp_path, cfg)
+    tracks = tmp_path / "tracks"
+    assert sorted(p.name for p in tracks.iterdir()) == ["Pen.flac", "Titar.flac"]
+    assert (tracks / "Titar.flac").read_bytes() == b"aa"
+    assert isinstance(result, PrepareResult)
+    assert sorted(result.tags) == ["Pen", "Titar"]
+
+
+def test_idempotent(tmp_path, cfg):
+    _zip(tmp_path, {"1-player_one.flac": b"aa"})
+    prepare_tracks(tmp_path, cfg)
+    second = prepare_tracks(tmp_path, cfg)
+    assert second.extracted == [] and second.renamed == {} and second.deleted == []
+
+
+def test_already_renamed_tracks_accepted(tmp_path, cfg):
     tracks = tmp_path / "tracks"
     tracks.mkdir()
-    for name in [
-        "1-player_one.flac",
-        "2-gamemaster.flac",
-        "3-penny42.flac",
-        "4-_playerfour.flac",
-        "5-player_three.flac",
-    ]:
-        (tracks / name).write_bytes(b"")
-
-    renamed = apply_speaker_mapping(tracks, rules)
-    assert set(renamed.values()) == {"Titar", "GM", "Pen", "Kashkyst", "Khalebe"}
-    final = {p.name for p in tracks.glob("*.flac")}
-    assert final == {"Titar.flac", "GM.flac", "Pen.flac", "Kashkyst.flac", "Khalebe.flac"}
+    (tracks / "GM.flac").write_bytes(b"gm")
+    (tracks / "info.txt").write_text("kept")
+    result = prepare_tracks(tmp_path, cfg)
+    assert result.tags == ["GM"]
+    assert (tracks / "info.txt").exists()
 
 
-def test_apply_speaker_mapping_idempotent(tmp_path, rules):
-    """Second run must be a no-op."""
+def test_raw_names_in_tracks_plus_archive_no_duplicates(tmp_path, cfg):
+    _zip(tmp_path, {"1-player_one.flac": b"aa", "2-gamemaster.flac": b"bb"})
     tracks = tmp_path / "tracks"
     tracks.mkdir()
-    (tracks / "1-player_one.flac").write_bytes(b"")
-    apply_speaker_mapping(tracks, rules)
-    second = apply_speaker_mapping(tracks, rules)
-    assert second == {}
-    assert (tracks / "Titar.flac").exists()
+    (tracks / "1-player_one.flac").write_bytes(b"aa")
+    prepare_tracks(tmp_path, cfg)
+    assert sorted(p.name for p in tracks.glob("*.flac")) == ["GM.flac", "Titar.flac"]
 
 
-def test_apply_speaker_mapping_unknown_kept(tmp_path, rules, caplog):
+def test_ignored_track_in_tracks_is_deleted(tmp_path, cfg):
     tracks = tmp_path / "tracks"
     tracks.mkdir()
-    (tracks / "9-stranger.flac").write_bytes(b"hi")
-    renamed = apply_speaker_mapping(tracks, rules)
-    assert renamed == {}
-    assert (tracks / "9-stranger.flac").exists()
+    (tracks / "3-Spoticord_Music_4270.flac").write_bytes(b"music")
+    (tracks / "GM.flac").write_bytes(b"gm")
+    result = prepare_tracks(tmp_path, cfg)
+    assert not (tracks / "3-Spoticord_Music_4270.flac").exists()
+    assert result.deleted == ["3-Spoticord_Music_4270.flac"]
 
 
-def test_apply_speaker_mapping_no_rules(tmp_path):
+def test_archive_is_never_modified(tmp_path, cfg):
+    archive = _zip(tmp_path, {"1-player_one.flac": b"aa", "2-Spoticord_Music_4270.flac": b"bb"})
+    before = archive.read_bytes()
+    prepare_tracks(tmp_path, cfg)
+    assert archive.read_bytes() == before
+
+
+def test_unknown_track_fails(tmp_path, cfg):
+    _zip(tmp_path, {"7-guest.flac": b"zz"})
+    with pytest.raises(TrackPreparationError, match="7-guest.flac"):
+        prepare_tracks(tmp_path, cfg)
+
+
+def test_unknown_in_tracks_fails(tmp_path, cfg):
     tracks = tmp_path / "tracks"
     tracks.mkdir()
-    (tracks / "1-player_one.flac").write_bytes(b"")
-    assert apply_speaker_mapping(tracks, []) == {}
+    (tracks / "7-guest.flac").write_bytes(b"zz")
+    with pytest.raises(TrackPreparationError, match="CW_SPEAKERS or CW_IGNORE_TRACKS"):
+        prepare_tracks(tmp_path, cfg)
+
+
+def test_rename_collision_fails(tmp_path, cfg):
+    tracks = tmp_path / "tracks"
+    tracks.mkdir()
+    (tracks / "1-player_one.flac").write_bytes(b"aa")
+    (tracks / "Titar.flac").write_bytes(b"other")
+    with pytest.raises(TrackPreparationError, match="already exists"):
+        prepare_tracks(tmp_path, cfg)
+
+
+def test_interrupted_extraction_recovered(tmp_path, cfg):
+    _zip(tmp_path, {"1-player_one.flac": b"aa", "2-gamemaster.flac": b"bb"})
+    tracks = tmp_path / "tracks"
+    leftover = tracks / ".extract-tmp"
+    leftover.mkdir(parents=True)
+    (leftover / "2-gamemaster.flac").write_bytes(b"b")  # partial file from a crash
+    prepare_tracks(tmp_path, cfg)
+    assert not leftover.exists()
+    assert (tracks / "GM.flac").read_bytes() == b"bb"
+    assert (tracks / "Titar.flac").read_bytes() == b"aa"
+
+
+def test_no_tracks_at_all_fails(tmp_path, cfg):
+    with pytest.raises(TrackPreparationError, match="no speaker track"):
+        prepare_tracks(tmp_path, cfg)
+
+
+def test_validate_only_mode_rejects_raw_names(tmp_path, cfg):
+    tracks = tmp_path / "tracks"
+    tracks.mkdir()
+    (tracks / "1-player_one.flac").write_bytes(b"aa")
+    with pytest.raises(TrackPreparationError, match="not renamed"):
+        prepare_tracks(tmp_path, cfg, rename=False)
     assert (tracks / "1-player_one.flac").exists()
 
 
-def test_apply_speaker_mapping_collision(tmp_path, rules):
-    """Two source tracks resolving to the same display name: second is left alone."""
+def test_validate_only_mode_accepts_tags(tmp_path, cfg):
     tracks = tmp_path / "tracks"
     tracks.mkdir()
-    (tracks / "Titar.flac").write_bytes(b"existing")
-    (tracks / "1-player_one.flac").write_bytes(b"new")
-    renamed = apply_speaker_mapping(tracks, rules)
-    assert renamed == {}
-    assert (tracks / "Titar.flac").exists()
-    assert (tracks / "1-player_one.flac").exists()
-
-
-# --- unzip_craig_archive ---
-
-def test_unzip_extracts_only_flacs(tmp_path):
-    session = tmp_path / "session"
-    session.mkdir()
-    archive = session / "craig-ABCDEF.flac.zip"
-    _make_zip(archive, {
-        "1-player_one.flac": b"flac1",
-        "2-gamemaster.flac": b"flac2",
-        "info.txt": b"meta",
-        "raw.dat": b"raw",
-    })
-
-    tracks = session / "tracks"
-    extracted = unzip_craig_archive(session, tracks)
-    assert extracted is True
-    assert {p.name for p in tracks.iterdir()} == {
-        "1-player_one.flac",
-        "2-gamemaster.flac",
-    }
-
-
-def test_unzip_skipped_when_tracks_populated(tmp_path):
-    session = tmp_path / "session"
-    session.mkdir()
-    _make_zip(session / "craig-X.flac.zip", {"1-player_one.flac": b"x"})
-    tracks = session / "tracks"
-    tracks.mkdir()
-    (tracks / "already.flac").write_bytes(b"existing")
-
-    assert unzip_craig_archive(session, tracks) is False
-    assert (tracks / "already.flac").exists()
-    assert not (tracks / "1-player_one.flac").exists()
-
-
-def test_unzip_no_archive(tmp_path):
-    session = tmp_path / "session"
-    session.mkdir()
-    assert unzip_craig_archive(session, session / "tracks") is False
-
-
-# --- prepare_tracks (integration) ---
-
-def test_prepare_tracks_end_to_end(tmp_path, mapping_file):
-    session = tmp_path / "session27"
-    session.mkdir()
-    _make_zip(session / "craig-XYZ.flac.zip", {
-        "1-player_one.flac": b"a",
-        "2-gamemaster.flac": b"b",
-        "3-penny42.flac": b"c",
-        "4-player_three.flac": b"d",
-        "5-_playerfour.flac": b"e",
-        "info.txt": b"meta",
-        "raw.dat": b"raw",
-    })
-
-    extracted, renamed = prepare_tracks(session, mapping_path=mapping_file)
-    assert extracted is True
-    assert set(renamed.values()) == {"Titar", "GM", "Pen", "Khalebe", "Kashkyst"}
-
-    final = {p.name for p in (session / "tracks").glob("*.flac")}
-    assert final == {"Titar.flac", "GM.flac", "Pen.flac", "Khalebe.flac", "Kashkyst.flac"}
-
-
-def test_prepare_tracks_idempotent(tmp_path, mapping_file):
-    session = tmp_path / "session"
-    session.mkdir()
-    _make_zip(session / "craig-XYZ.flac.zip", {"1-player_one.flac": b"a"})
-
-    first = prepare_tracks(session, mapping_path=mapping_file)
-    second = prepare_tracks(session, mapping_path=mapping_file)
-    assert first == (True, {"1-player_one": "Titar"})
-    assert second == (False, {})
-    assert (session / "tracks" / "Titar.flac").exists()
+    (tracks / "GM.flac").write_bytes(b"gm")
+    assert prepare_tracks(tmp_path, cfg, rename=False).tags == ["GM"]

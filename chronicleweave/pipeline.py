@@ -11,7 +11,7 @@ import select
 
 # --- Imports ---
 from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING_CONFIG
-from .modules.prepare_tracks import prepare_tracks, DEFAULT_MAPPING_PATH
+from .modules.prepare_tracks import prepare_tracks, speaker_config_from_env, SpeakerConfig
 from .modules.whisperx_corrector_core import correct_whisperx_outputs, WhisperXCorrectorConfig, DEFAULT_CONFIG as DEFAULT_CORRECTOR_CONFIG
 from .modules.convert_json_to_srt import convert_json_folder_to_srt
 from .modules.merge_srt_by_chunk import merge_srt_by_chunk, SRTMergeConfig, DEFAULT_MERGE_CONFIG
@@ -53,7 +53,6 @@ class PipelineConfig:
 
     # Track preparation (auto-unzip + speaker rename)
     auto_prepare_tracks: bool = True
-    speaker_mapping_path: Optional[Path] = None  # None = use packaged default
 
     # Execution Control
     steps_to_run: Union[slice, List[int], Tuple[int, ...]] = slice(1, 10) # Default: run steps 1-9
@@ -503,17 +502,11 @@ def run_pipeline(
     if config.auto_prepare_tracks and should_run_step(1, config.steps_to_run):
         log.info("=== Step 0: Preparing tracks (unzip + speaker rename) ===")
         try:
-            extracted, renamed = prepare_tracks(
+            prepare_tracks(
                 session_path=config.base_path,
+                speakers=speaker_config_from_env(),
                 tracks_folder_name=config.input_audio_folderName,
-                mapping_path=config.speaker_mapping_path,
             )
-            if extracted:
-                log.info("Craig archive extracted into tracks/.")
-            if renamed:
-                log.info(f"Speaker mapping applied: {renamed}")
-            elif not extracted:
-                log.debug("Step 0: nothing to do (already prepared).")
         except Exception:
             # Non-critical: if this fails, the user can still run the manual flow.
             log.exception("!!! Step 0 (Prepare Tracks) FAILED (Non-Critical) !!!")
