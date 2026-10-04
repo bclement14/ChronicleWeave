@@ -32,17 +32,17 @@ Read the full story behind ChronicleWeave in the **🌱 Context and Origin** sec
 - ⏱️ **SRT Subtitle Generation** with speaker labels.
 - 💬 **Speaker Turn Merging** for cleaner SRT output.
 - 📝 **Plain Text Script Generation**.
-- 🧹 **Low RAM Mode** option for audio processing on systems with limited memory.
+- 📚 **Batch mode** over many `session<N>` folders, skipping finished ones.
 - 🗂️ **Organized Folder Structure** per session.
-- 🔧 **Configurable Pipeline Steps**.
+- 🔧 **Selectable step range** (one contiguous range within 1-9).
 
 ---
 
 ## ⚙️ System Requirements
 
-1.  **Python:** >= 3.8
+1.  **Python:** >= 3.10
 2.  **Docker:** Required for running WhisperX transcription. Docker Engine needs to be installed and running. GPU access configured within Docker is highly recommended for performance. [Install Docker](https://docs.docker.com/engine/install/)
-3.  **FFmpeg:** Required by the `pydub` library for audio manipulation.
+3.  **FFmpeg:** Required to merge the tracks and cut them into chunks (called directly).
     - Install via your system's package manager (e.g., `sudo apt install ffmpeg`, `brew install ffmpeg`) or download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to your system's PATH.
     - Verify with: `ffmpeg -version`
 
@@ -56,7 +56,7 @@ ChronicleWeave leverages the powerful **[WhisperX](https://github.com/m-bain/whi
 
 - **Dependency Management:** Encapsulates the specific versions of WhisperX, PyTorch, CUDA, cuDNN, and other dependencies known to work together reliably. This avoids common environment setup problems reported by users online.
 - **Reproducibility:** Ensures the transcription step runs the same way regardless of the host machine's specific Python or CUDA setup.
-- **Ease of Use:** The pipeline handles running the container, mounting volumes, and passing arguments automatically when `run_whisperx=True`.
+- **Ease of Use:** The pipeline handles running the container, mounting volumes, and passing arguments automatically unless `--no-whisperx` is given.
 
 **Setup:**
 
@@ -74,107 +74,83 @@ Once built, the `run_pipeline` function will use the `chronicleweave-whisperx` i
 
 ## 🚀 Quickstart & Development Setup
 
-### 1. Clone the Repository
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/bclement14/chronicleweave.git
 cd chronicleweave
+uv venv ~/.venvs/chronicleweave
+uv pip install --python ~/.venvs/chronicleweave/bin/python -e ".[dev]"
 ```
 
-### 2. Create Virtual Environment (Recommended)
+This installs the `chronicleweave` and `chronicleweave-batch` commands in `~/.venvs/chronicleweave/bin/`.
 
-```bash
-python -m venv .venv
-# Activate it:
-source .venv/bin/activate  # On Linux/macOS
-# .\.venv\Scripts\activate  # On Windows PowerShell
-# .\venv\Scripts\activate.bat # On Windows Cmd
-```
-
-### 3. Install Dependencies
-
-Install the package in editable mode (`-e`) along with development dependencies (like `pytest`):
-
-```bash
-pip install -e ".[dev]"
-```
-
-If you only want to install the package for usage (without test dependencies):
-
-```bash
-pip install .
-```
-
-### 4. Build the WhisperX Docker Image
-
-Build the Docker image required by the pipeline once:
+### 2. Build the WhisperX Docker image
 
 ```bash
 docker build -t chronicleweave-whisperx .
 ```
 
-_(Ensure the Dockerfile is present in the project root)_
+### 3. Configure `.env`
 
-### 5. Prepare Your Session Folder
+Copy `.env.example` to `.env` (gitignored) and edit it:
 
-Create a base directory for your session and place the individual speaker audio tracks (e.g., FLAC files from Craig) inside a subfolder named `tracks` (or your configured input folder name):
+- `CW_SPEAKERS`: comma-separated `craig_username:Tag` pairs. Tags are the speaker names used in the script.
+- `CW_IGNORE_TRACKS`: tracks whose username contains one of these words (case-insensitive) are dropped, e.g. `Spoticord`.
+
+Steps 1-8 need no API key. The `.env` is looked up in the current folder and its parents, then the repository root; `--env-file PATH` uses a specific file, and values already set in the shell win.
+
+### 4. Prepare a session folder
+
+Put the Craig archive (`craig-*.flac.zip`) in the session folder, or the speaker `.flac` files in a `tracks/` subfolder:
 
 ```
-your_session_name/
-└── tracks/
-    ├── speaker1.flac
-    ├── speaker2.flac
-    └── speaker3.flac
+session26/
+└── craig-XXXX.flac.zip
 ```
 
-### 6. Run the Pipeline (Example)
+### 5. Run
 
-Create a Python script (e.g., `process_session.py`) or use an interactive Python session (like IPython/Jupyter):
+One session:
 
-```python
-from chronicleweave.pipeline import run_pipeline
-from pathlib import Path
-
-# Define the path to your session directory
-session_path = Path("./your_session_name") # Use relative or absolute path
-
-# Basic run (using most defaults)
-run_pipeline(base_path=str(session_path))
-
-# --- OR ---
-
-# Run with specific options
-run_pipeline(
-    base_path=str(session_path),
-    # input_audio_folderName="craig_audio", # Example: If your folder isn't 'tracks'
-    diarize=False, # Example: Disable diarization if not needed
-    use_low_ram=True,
-    log_level="INFO", # Set to "DEBUG" for more detail
-    # Run only specific steps (e.g., chunking and transcription)
-    # steps_to_run=[1, 2]
-    # steps_to_run=slice(1, 4) # Steps 1, 2, 3
-)
-
-print(f"Pipeline processing finished for {session_path.name}!")
+```bash
+chronicleweave -b /path/to/session26 [--steps 1-8]
 ```
+
+Every `session<N>` folder under a root, one after another (sessions already done are skipped; a failure does not stop the batch):
+
+```bash
+chronicleweave-batch /path/to/Sessions [--only 13,15-19] [--force]
+```
+
+The batch prints a summary (OK / FAILED / SKIPPED, duration, log) and exits with 1 if any session failed. Run the same command again to resume.
+
+Both commands accept `--steps`, `--log-level`, `--verbose`, `--env-file`, `--no-whisperx`, `--diarize`, `--whisperx-model` (name or local CTranslate2 folder, default `large-v3`) and `--whisperx-language` (default `fr`). Exit code is 0 on success, 1 on failure.
 
 ---
 
 ## 🧹 Pipeline Steps Overview
 
-The `run_pipeline` function executes the following steps (configurable via `steps_to_run`):
+`--steps` takes one step or one contiguous range within 1-9 (e.g. `5` or `2-7`). The default is **1-8**. Step 9 (LLM processing through a paid API) is optional and off by default.
 
-| Step | Module (`chronicleweave.modules.*`) | Action                       | Output Location (Default)        |
-| :--- | :---------------------------------- | :--------------------------- | :------------------------------- |
-| 1    | `audio_chunker`                     | Chunk audio based on silence | `chunked_tracks/`                |
-| 2    | `pipeline` (internal Docker call)   | Transcribe chunks (WhisperX) | `wx_output/`                     |
-| 3    | `whisperx_corrector_core`           | Correct JSON timestamps      | `json_files/`                    |
-| 4    | `convert_json_to_srt`               | Convert JSON to SRT          | `srt_files/`                     |
-| 5    | `merge_srt_by_chunk`                | Merge chunk SRTs w/ offset   | `final_outputs/merged_*.srt`     |
-| 6    | `merge_speaker_entries`             | Merge consecutive speakers   | `final_outputs/cleaned_*.srt`    |
-| 7    | `convert_srt_to_script`             | Create plain text script     | `final_outputs/final_script.txt` |
+| Step | Action                                                                                          | Output (default)                              |
+| :--- | :---------------------------------------------------------------------------------------------- | :-------------------------------------------- |
+| 0    | Prepare tracks: extract the Craig archive, rename tracks to speaker Tags, drop ignored tracks   | `tracks/`                                     |
+| 1    | ffmpeg merges all tracks (16 kHz mono), finds silence cut points, ffmpeg slices each track      | `chunked_tracks/`, `final_outputs/cut_points.txt` |
+| 2    | WhisperX `large-v3` in the existing Docker image (model cache `~/.cache/chronicleweave`)        | `wx_output/`                                  |
+| 3    | Correct JSON timestamps                                                                         | `json_files/`                                 |
+| 4    | Convert JSON to SRT                                                                             | `srt_files/`                                  |
+| 5    | Merge chunk SRTs using the cut-point offsets                                                    | `final_outputs/merged_transcript.srt`         |
+| 6    | Merge consecutive entries of the same speaker                                                   | `final_outputs/cleaned_transcript.srt`        |
+| 7    | Create the plain text script                                                                    | `final_outputs/final_script.txt`              |
+| 8    | Split the script into chunks                                                                    | `final_outputs/script_chunks/`                |
+| 9    | Optional: LLM processing through an API (needs a key, off by default)                           | configured LLM output                         |
 
-Intermediate files are stored in subdirectories within your `base_path`. Final key outputs land in the `final_outputs` directory by default.
+Step 0 runs automatically before step 1 unless `--no-prepare-tracks` is given.
+
+**Outputs.** Each run writes `pipeline.log` in the session folder. A successful run writes the completion marker `final_outputs/.chronicleweave_done.json`; the batch treats a session as done when this marker exists, or, for sessions processed before the marker existed, when `final_script.txt` exists and no `final_outputs/.chronicleweave_running` marker is left behind by a crashed run.
+
+**Re-running.** A run starting at step k first removes the outputs of steps k to 8, then regenerates them. `tracks/` and the Craig archives are never deleted.
 
 ---
 
@@ -235,10 +211,10 @@ your_session_name/
 
 To run the unit tests:
 
-1.  Ensure development dependencies are installed: `pip install -e ".[dev]"`
+1.  Ensure development dependencies are installed: `uv pip install --python ~/.venvs/chronicleweave/bin/python -e ".[dev]"`
 2.  Run pytest from the project root directory:
     ```bash
-    pytest
+    ~/.venvs/chronicleweave/bin/python -m pytest -q
     ```
 
 ---
