@@ -6,8 +6,7 @@ import logging
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field, replace, fields
-from typing import Optional, Union, List, Tuple, Sequence, Dict, Any
-import select
+from typing import Optional, Union, List, Tuple, Sequence, Dict, Any, Mapping
 
 # --- Imports ---
 from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING_CONFIG
@@ -66,8 +65,9 @@ class PipelineConfig:
 
     # External Tools Config
     whisperx_docker_image: str = "chronicleweave-whisperx"
-    whisperx_model: str = "large-v3-turbo"  # Whisper checkpoint passed to `whisperx --model`.
+    whisperx_model: str = "large-v3"        # Whisper checkpoint, or a local model folder, passed to `whisperx --model`.
     whisperx_language: str = "fr"           # ISO code; "auto" lets WhisperX detect.
+    whisperx_cache_dir: Optional[Path] = None  # None -> DEFAULT_CACHE_DIR; mounted at /root/.cache.
 
     # Module Specific Configs
     chunking_config: ChunkingConfig = field(default_factory=lambda: DEFAULT_CHUNKING_CONFIG)
@@ -112,6 +112,51 @@ class PipelineConfig:
 
 # --- Logger Setup ---
 log = logging.getLogger("chronicleweave.pipeline") # Specific logger for this module
+docker_log = logging.getLogger("chronicleweave.docker")
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "chronicleweave"
+
+
+def redact_command(cmd: Sequence[str]) -> str:
+    parts = list(cmd)
+    for i, part in enumerate(parts[:-1]):
+        if part == "--hf_token":
+            parts[i + 1] = "****"
+    return " ".join(parts)
+
+
+def build_whisperx_command(
+    session_path: Path,
+    chunk_files: Sequence[Path],
+    config: PipelineConfig,
+    environ: Mapping[str, str] = os.environ,
+) -> List[str]:
+    cache_dir = (config.whisperx_cache_dir or DEFAULT_CACHE_DIR).expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)  # created by us, not root-owned by docker
+    mounts = ["-v", f"{session_path.resolve()}:/app", "-v", f"{cache_dir}:/root/.cache"]
+    model_arg = config.whisperx_model
+    model_path = Path(config.whisperx_model).expanduser()
+    if model_path.is_dir():
+        container_model = f"/models/{model_path.name}"
+        mounts += ["-v", f"{model_path.resolve()}:{container_model}:ro"]
+        model_arg = container_model
+    env_args: List[str] = []
+    if environ.get("HF_HUB_OFFLINE"):
+        env_args += ["-e", f"HF_HUB_OFFLINE={environ['HF_HUB_OFFLINE']}"]
+    container_chunks = Path("/app") / config.chunks_audio_folderName
+    whisperx_args = [
+        "whisperx", *[str(container_chunks / f.name) for f in chunk_files],
+        "--model", model_arg,
+        "--language", config.whisperx_language,
+        "--output_dir", str(Path("/app") / config.whisperx_output_folderName),
+        "--output_format", "json",
+    ]
+    if config.diarize:
+        hf_token = config.huggingface_token or environ.get("HF_TOKEN")
+        if not hf_token:
+            raise ValueError("Diarization enabled, but Hugging Face token (HF_TOKEN) missing.")
+        whisperx_args += ["--diarize", "--hf_token", hf_token]
+    return ["docker", "run", "--gpus", "all", "--rm", "--ipc=host", *mounts, *env_args,
+            config.whisperx_docker_image, *whisperx_args]
 
 # --- Helper Functions ---
 
@@ -235,147 +280,26 @@ def run_whisperx_docker(
     chunks_folder_name: str, # Changed to be just the name, not the full path
     config: PipelineConfig # Pass the full config for access to other settings if needed
     ) -> None:
-    """Run WhisperX Docker, streaming output in real-time."""
-    log.info("Attempting WhisperX transcription via Docker (streaming output)...")
-    
-    # Construct paths using session_path and names from config
-    chunks_dir = session_path / chunks_folder_name # Chunks folder relative to session_path
-    whisperx_output_dir_on_host = session_path / config.whisperx_output_folderName
-
-    # Ensure host output directory for WhisperX exists (Docker will mount into it)
-    try:
-        whisperx_output_dir_on_host.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        log.error(f"Could not create WhisperX host output directory: {whisperx_output_dir_on_host}. Error: {e}")
-        raise
-
+    chunks_dir = session_path / chunks_folder_name
+    out_dir = session_path / config.whisperx_output_folderName
     if not chunks_dir.is_dir():
-        log.error(f"Chunk directory not found: {chunks_dir}")
         raise FileNotFoundError(f"Chunk directory not found: {chunks_dir}")
-
-    flac_files = list(chunks_dir.glob("*.flac"))
+    flac_files = sorted(chunks_dir.glob("*.flac"))
     if not flac_files:
-        log.warning(f"No .flac files found in {chunks_dir}. WhisperX will not run.")
-        # Depending on requirements, this could be an error or just a skip.
-        # For now, let it proceed, WhisperX CLI might handle empty input gracefully or error out.
-        # raise FileNotFoundError(f"No .flac files found in {chunks_dir}")
-        return # Or raise if it's critical
-
-    log.info(f"Found {len(flac_files)} .flac files for transcription in {chunks_dir}.")
-
-    # Docker paths (relative to the mount point inside the container)
-    # session_path.resolve() is mounted to /app in the container
-    container_app_path = Path("/app")
-    container_chunk_dir = container_app_path / chunks_folder_name
-    container_whisperx_output_dir = container_app_path / config.whisperx_output_folderName
-
-    input_args_for_container = [str(container_chunk_dir / f.name) for f in flac_files]
-    
-    whisperx_args = [
-        "whisperx", *input_args_for_container,
-        "--model", config.whisperx_model,
-        "--language", config.whisperx_language,
-        "--output_dir", str(container_whisperx_output_dir),
-        "--output_format", "json",
-    ]
-
-    if config.diarize:
-        hf_token = config.huggingface_token or os.environ.get("HF_TOKEN")
-        if not hf_token:
-            log.error("Diarization enabled, but Hugging Face token (HF_TOKEN) missing in config or environment.")
-            raise ValueError("Diarization enabled, but Hugging Face token missing.")
-        log.info("Diarization enabled for WhisperX.")
-        whisperx_args.extend(["--diarize", "--hf_token", hf_token])
-    
-    # Add low VRAM options if specified, though WhisperX handles this internally to some extent
-    # if config.use_low_ram: # This flag is for audio_chunker, WhisperX might have its own
-    #    whisperx_args.extend(["--compute_type", "int8"]) # Example, check WhisperX docs
-
-    volume_mount = f"{session_path.resolve()}:/app" # Mount the whole session path
-    
-    docker_command: List[str] = [
-        "docker", "run",
-        "--gpus", "all", # Assumes NVIDIA GPU and nvidia-docker toolkit
-        "--rm",          # Automatically remove the container when it exits
-        "-v", volume_mount,
-        "--ipc=host",    # Often recommended for PyTorch/shared memory
-        config.whisperx_docker_image,
-        *whisperx_args
-    ]
-
-    log.info(f"Executing Docker command: {' '.join(docker_command)}")
-
-    process = None
-    try:
-        # bufsize=1 for line buffering, text=True for string streams
-        process = subprocess.Popen(
-            docker_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8', # Explicit encoding
-            errors='replace', # Handle potential decoding errors in output
-            bufsize=1 
-        )
-
-        # Non-blocking read using select
-        streams = {process.stdout: sys.stdout, process.stderr: sys.stderr}
-        while process.poll() is None: # While process is running
-            # select.select waits until one of the file descriptors is "ready"
-            # The last argument is a timeout in seconds.
-            readable_streams, _, _ = select.select(streams.keys(), [], [], 0.1) 
-            
-            for stream_obj in readable_streams:
-                line = stream_obj.readline() # Read one line
-                if line:
-                    # Determine if it's STDOUT or STDERR from Docker
-                    prefix = "[Docker STDOUT] " if stream_obj is process.stdout else "[Docker STDERR] "
-                    # Write to corresponding system stream (sys.stdout or sys.stderr)
-                    streams[stream_obj].write(prefix + line)
-                    streams[stream_obj].flush() # Ensure it's written immediately
-
-        # After process finishes, read any remaining output
-        stdout_remaining, stderr_remaining = process.communicate()
-        if stdout_remaining:
-            for line in stdout_remaining.splitlines(): # Split into lines
-                 sys.stdout.write("[Docker STDOUT] " + line + "\n")
-            sys.stdout.flush()
-        if stderr_remaining:
-             for line in stderr_remaining.splitlines():
-                 sys.stderr.write("[Docker STDERR] " + line + "\n")
-             sys.stderr.flush()
-
-        retcode = process.returncode
-        if retcode != 0:
-            log.error(f"WhisperX Docker command failed with exit code {retcode}.")
-            raise RuntimeError(f"WhisperX Docker execution failed (exit code {retcode}).")
-        else:
-            log.info("WhisperX Docker command completed successfully.")
-
-    except FileNotFoundError:
-        log.exception("Docker command not found. Is Docker installed and in PATH?")
-        raise
-    except Exception as e:
-        log.exception(f"An unexpected error occurred while running WhisperX Docker: {e}")
-        raise
-    finally:
-        # This block executes regardless of exceptions in the try block.
-        if process:
-            # Ensure stdout and stderr pipes are closed
-            if process.stdout and not process.stdout.closed:
-                process.stdout.close()
-            if process.stderr and not process.stderr.closed:
-                process.stderr.close()
-            # Wait for the process to terminate to release system resources
-            try:
-                process.wait(timeout=5) # Wait for a short period
-            except subprocess.TimeoutExpired:
-                log.warning("Docker process did not terminate gracefully, attempting to kill.")
-                process.kill() # Force kill if it doesn't respond
-                try:
-                    process.wait(timeout=5) # Wait again after kill
-                except subprocess.TimeoutExpired:
-                    log.error("Failed to kill Docker process.")
+        raise FileNotFoundError(f"No .flac chunk files in {chunks_dir}; nothing to transcribe.")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = build_whisperx_command(session_path, flac_files, config)
+    log.info(f"Transcribing {len(flac_files)} chunk files with WhisperX ({config.whisperx_model}).")
+    log.info(f"Executing Docker command: {redact_command(cmd)}")
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding="utf-8", errors="replace", bufsize=1)
+    assert process.stdout is not None
+    for line in process.stdout:
+        docker_log.info(line.rstrip())
+    retcode = process.wait()
+    if retcode != 0:
+        raise RuntimeError(f"WhisperX Docker execution failed (exit code {retcode}).")
+    log.info("WhisperX Docker command completed successfully.")
 
 
 # --- Main Pipeline Function ---
