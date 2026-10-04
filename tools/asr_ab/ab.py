@@ -144,24 +144,25 @@ def build_page(items: List[dict], a_name: str, b_name: str, chunks_dir: Path, ou
     return page, mapping_path
 
 
-def score(answers_path: Path, mapping_path: Path, a_script: Path, b_script: Path) -> dict:
+def score(answers_path: Path, mapping_path: Path, scripts: Dict[str, Path]) -> dict:
+    """scripts maps model name -> that model's final_script.txt."""
     answers = json.loads(Path(answers_path).read_text(encoding="utf-8"))
     mapping = json.loads(Path(mapping_path).read_text(encoding="utf-8"))
     models = sorted({m for v in mapping.values() for m in v.values()})
     wins = {m: 0 for m in models}
     ties = 0
+    ignored = 0
     for item_id, choice in answers.items():
-        if choice == "same":
+        if item_id not in mapping or choice not in ("X", "Y", "same"):
+            ignored += 1
+        elif choice == "same":
             ties += 1
-        elif item_id in mapping and choice in ("X", "Y"):
+        else:
             wins[mapping[item_id][choice]] += 1
     non_tied = sum(wins.values())
-    loops = {
-        "a_script": repetition_loops(Path(a_script).read_text(encoding="utf-8")),
-        "b_script": repetition_loops(Path(b_script).read_text(encoding="utf-8")),
-    }
+    loops = {name: repetition_loops(Path(path).read_text(encoding="utf-8")) for name, path in scripts.items()}
     decision = "inconclusive" if non_tied < 20 else "pending"  # final rule applied in main()
-    return {"wins": wins, "ties": ties, "non_tied": non_tied, "loops": loops,
+    return {"wins": wins, "ties": ties, "non_tied": non_tied, "ignored": ignored, "loops": loops,
             "decision": decision, "models": models}
 
 
@@ -175,7 +176,8 @@ def main(argv=None) -> int:
     b.add_argument("--n", type=int, default=30)
     s = sub.add_parser("score")
     s.add_argument("--answers", type=Path, required=True); s.add_argument("--mapping", type=Path, required=True)
-    s.add_argument("--a-script", type=Path, required=True); s.add_argument("--b-script", type=Path, required=True)
+    s.add_argument("--a-name", required=True); s.add_argument("--a-script", type=Path, required=True)
+    s.add_argument("--b-name", required=True); s.add_argument("--b-script", type=Path, required=True)
     s.add_argument("--candidate", required=True, help="Model name that would replace the baseline.")
     args = parser.parse_args(argv)
     if args.cmd == "build":
@@ -183,15 +185,22 @@ def main(argv=None) -> int:
         page, mapping = build_page(items, args.a_name, args.b_name, args.chunks, args.out)
         print(f"{len(items)} items. Open {page} in a browser; mapping kept in {mapping}.")
         return 0
-    result = score(args.answers, args.mapping, args.a_script, args.b_script)
     cand = args.candidate
-    other = [m for m in result["models"] if m != cand]
+    mapping_models = sorted({m for v in json.loads(args.mapping.read_text(encoding="utf-8")).values() for m in v.values()})
+    if sorted({args.a_name, args.b_name}) != mapping_models:
+        print(f"error: --a-name/--b-name ({args.a_name}, {args.b_name}) do not match the models in the mapping {mapping_models}", file=sys.stderr)
+        return 2
+    if cand not in mapping_models:
+        print(f"error: --candidate {cand!r} is not one of {mapping_models}", file=sys.stderr)
+        return 2
+    result = score(args.answers, args.mapping, {args.a_name: args.a_script, args.b_name: args.b_script})
+    base = [m for m in result["models"] if m != cand][0]
     if result["non_tied"] < 20:
-        result["decision"] = "inconclusive -> keep baseline"
-    elif result["wins"].get(cand, 0) * 3 >= result["non_tied"] * 2 and result["loops"]["b_script"] <= result["loops"]["a_script"]:
+        result["decision"] = f"inconclusive -> keep {base}"
+    elif result["wins"][cand] * 3 >= result["non_tied"] * 2 and result["loops"][cand] <= result["loops"][base]:
         result["decision"] = f"switch to {cand}"
     else:
-        result["decision"] = f"keep {other[0] if other else 'baseline'}"
+        result["decision"] = f"keep {base}"
     print(json.dumps(result, indent=1))
     return 0
 

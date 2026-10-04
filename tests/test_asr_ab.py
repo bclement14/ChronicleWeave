@@ -8,6 +8,7 @@ from pydub import AudioSegment
 from tools.asr_ab.ab import (
     build_page,
     build_windows,
+    main,
     normalise,
     repetition_loops,
     score,
@@ -73,6 +74,76 @@ def test_build_page_and_score(tmp_path):
     answers.write_text(json.dumps({"i1": winner_label}))
     a_script, b_script = tmp_path / "a.txt", tmp_path / "b.txt"
     a_script.write_text("[GM] ok"); b_script.write_text("[GM] ok")
-    result = score(answers, mapping_path, a_script, b_script)
+    result = score(answers, mapping_path, {"large-v3": a_script, "dec16": b_script})
     assert result["wins"]["dec16"] == 1 and result["non_tied"] == 1
     assert result["decision"] == "inconclusive"  # fewer than 20 non-tied judgments
+
+
+LOOP = "sous-titrage ST 501 " * 3
+
+
+def _score_cli(tmp_path, capsys, n_cand, n_base, n_tie=0, cand_script="ok", base_script="ok", candidate="dec16", b_name="dec16"):
+    mapping, answers = {}, {}
+    total = n_cand + n_base + n_tie
+    for i in range(total):
+        mapping[f"i{i}"] = {"X": "large-v3", "Y": "dec16"} if i % 2 else {"X": "dec16", "Y": "large-v3"}
+        if i < n_cand:
+            winner = "dec16"
+        elif i < n_cand + n_base:
+            winner = "large-v3"
+        else:
+            answers[f"i{i}"] = "same"
+            continue
+        answers[f"i{i}"] = [k for k, v in mapping[f"i{i}"].items() if v == winner][0]
+    (tmp_path / "m.json").write_text(json.dumps(mapping))
+    (tmp_path / "a.json").write_text(json.dumps(answers))
+    (tmp_path / "base.txt").write_text(base_script)
+    (tmp_path / "cand.txt").write_text(cand_script)
+    code = main(["score", "--answers", str(tmp_path / "a.json"), "--mapping", str(tmp_path / "m.json"),
+                 "--a-name", "large-v3", "--a-script", str(tmp_path / "base.txt"),
+                 "--b-name", b_name, "--b-script", str(tmp_path / "cand.txt"), "--candidate", candidate])
+    out = capsys.readouterr()
+    return code, (json.loads(out.out) if out.out else None), out.err
+
+
+def test_cli_19_non_tied_is_inconclusive(tmp_path, capsys):
+    code, res, _ = _score_cli(tmp_path, capsys, 19, 0)
+    assert code == 0 and res["non_tied"] == 19 and res["decision"] == "inconclusive -> keep large-v3"
+
+
+def test_cli_exactly_two_thirds_switches(tmp_path, capsys):
+    code, res, _ = _score_cli(tmp_path, capsys, 14, 7)
+    assert res["non_tied"] == 21 and res["decision"] == "switch to dec16"
+
+
+def test_cli_one_fewer_win_keeps_baseline(tmp_path, capsys):
+    code, res, _ = _score_cli(tmp_path, capsys, 13, 8)
+    assert res["decision"] == "keep large-v3"
+
+
+def test_cli_more_loops_in_candidate_keeps_baseline(tmp_path, capsys):
+    code, res, _ = _score_cli(tmp_path, capsys, 21, 0, cand_script=LOOP)
+    assert res["loops"] == {"large-v3": 0, "dec16": 1} and res["decision"] == "keep large-v3"
+
+
+def test_cli_ties_do_not_count(tmp_path, capsys):
+    code, res, _ = _score_cli(tmp_path, capsys, 19, 0, n_tie=10)
+    assert res["non_tied"] == 19 and res["ties"] == 10 and res["decision"].startswith("inconclusive")
+
+
+def test_cli_unknown_candidate_exits_2(tmp_path, capsys):
+    code, res, err = _score_cli(tmp_path, capsys, 21, 0, candidate="nope")
+    assert code == 2 and res is None and "nope" in err
+
+
+def test_cli_names_not_matching_mapping_exit_2(tmp_path, capsys):
+    code, res, err = _score_cli(tmp_path, capsys, 21, 0, b_name="other")
+    assert code == 2 and res is None and err
+
+
+def test_score_reports_ignored_answers(tmp_path):
+    (tmp_path / "m.json").write_text(json.dumps({"i1": {"X": "a", "Y": "b"}}))
+    (tmp_path / "a.json").write_text(json.dumps({"i1": "X", "zz": "X", "i2": "maybe"}))
+    (tmp_path / "s.txt").write_text("ok")
+    res = score(tmp_path / "a.json", tmp_path / "m.json", {"a": tmp_path / "s.txt", "b": tmp_path / "s.txt"})
+    assert res["ignored"] == 2 and res["non_tied"] == 1
