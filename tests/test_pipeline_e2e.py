@@ -149,3 +149,13 @@ def test_step8_only_rerun_keeps_marker(synthetic_session):
     _run(synthetic_session)
     run_pipeline(base_path=str(synthetic_session), steps_to_run="8", log_level="WARNING")
     assert (synthetic_session / "final_outputs" / DONE_MARKER_NAME).exists()
+
+
+def test_missing_speakers_fails_before_cleanup(synthetic_session, monkeypatch):
+    _run(synthetic_session)
+    monkeypatch.delenv("CW_SPEAKERS")
+    with pytest.raises(PipelineError):
+        _run(synthetic_session)
+    assert (synthetic_session / "final_outputs" / "final_script.txt").exists()
+    assert (synthetic_session / "wx_output").is_dir()
+    assert (synthetic_session / "final_outputs" / DONE_MARKER_NAME).exists()

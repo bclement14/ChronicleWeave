@@ -604,6 +604,12 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
     script = final / config.final_script_filename
     log.info(f"Session {config.base_path} — steps {steps.first}-{steps.last}, model {config.whisperx_model}")
 
+    speakers = config.speakers
+    if speakers is None and (steps.includes(1) or steps.includes(7)):
+        # an input of step 0 and of the step-7 gate: read before anything is deleted;
+        # a missing CW_SPEAKERS fails here, logged
+        speakers = _run_step(0, "Reading speaker configuration", speaker_config_from_env)
+
     if steps.first <= LAST_CLEANUP_STEP:
         check_step_inputs(config, steps.first)
         marker = final / DONE_MARKER_NAME
@@ -612,10 +618,6 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
         cleanup_outputs(config, steps.first)
     final.mkdir(parents=True, exist_ok=True)
 
-    speakers = config.speakers
-    if speakers is None and (steps.includes(1) or steps.includes(7)):
-        # needed for step 0 and for the step-7 gate; a missing CW_SPEAKERS fails here, logged
-        speakers = _run_step(0, "Reading speaker configuration", speaker_config_from_env)
     if steps.includes(1):
         _run_step(0, "Preparing tracks", lambda: prepare_tracks(
             config.base_path, speakers, config.input_audio_folderName, rename=config.auto_prepare_tracks))
