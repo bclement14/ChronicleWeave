@@ -520,7 +520,7 @@ def run_pipeline(
             chunk_audio(
                 input_folder=input_audio_folder, output_dir=chunked_audio_folder,
                 merged_file=merged_file_path, cut_points_file=cut_points_file_path,
-                use_low_ram=config.use_low_ram, config=config.chunking_config
+                config=config.chunking_config
             )
             steps_executed.append(1); log.info("--- Step 1 completed ---")
         except Exception as e:

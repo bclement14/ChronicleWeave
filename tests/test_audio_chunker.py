@@ -236,3 +236,117 @@ def test_write_cut_points_cannot_write(tmp_path: Path):
 # - _detect_silence_high_ram / _detect_silence_low_ram
 # - split_tracks
 # - chunk_audio (main function)
+
+# --- ffmpeg-based merge and slicing (spec 4.4) ---
+import subprocess
+import numpy as np
+from pydub import AudioSegment
+
+from chronicleweave.modules.audio_chunker import (
+    build_merge_command,
+    build_slice_command,
+    chunk_audio,
+    merge_tracks,
+    probe_duration_s,
+    split_tracks,
+)
+
+
+def _tone(path, seconds, freq=440, rate=48000, gain_db=-20.0, channels=2):
+    t = np.arange(int(seconds * rate)) / rate
+    samples = (np.sin(2 * np.pi * freq * t) * 32767 * 10 ** (gain_db / 20)).astype(np.int16)
+    seg = AudioSegment(samples.tobytes(), frame_rate=rate, sample_width=2, channels=1)
+    if channels == 2:
+        seg = seg.set_channels(2)
+    seg.export(path, format="flac")
+
+
+def test_merge_command_shape(tmp_path):
+    cmd = build_merge_command([tmp_path / "a.flac", tmp_path / "b.flac"], tmp_path / "m.flac")
+    joined = " ".join(cmd)
+    assert "amix=inputs=2:duration=longest:normalize=0" in joined
+    assert cmd[-7:] == ["-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(tmp_path / "m.flac")]
+    assert "aformat" not in joined
+
+
+def test_merge_sums_levels_not_average(tmp_path):
+    a, b = tmp_path / "a.flac", tmp_path / "b.flac"
+    _tone(a, 2.0, gain_db=-20.0)
+    _tone(b, 2.0, gain_db=-20.0)
+    out = tmp_path / "m.flac"
+    merge_tracks([a, b], out)
+    merged = AudioSegment.from_file(out)
+    assert merged.frame_rate == 16000 and merged.channels == 1 and merged.sample_width == 2
+    # two identical in-phase tones summed: +6 dB peak over one tone (amix fades the last inputs
+    # out near the end of short files, so compare peaks, not average level)
+    single = AudioSegment.from_file(a)
+    assert merged.max_dBFS - single.max_dBFS == pytest.approx(6.0, abs=0.5)
+
+
+def test_merge_uses_longest_duration(tmp_path):
+    a, b = tmp_path / "a.flac", tmp_path / "b.flac"
+    _tone(a, 1.0)
+    _tone(b, 3.0)
+    out = tmp_path / "m.flac"
+    merge_tracks([a, b], out)
+    assert probe_duration_s(out) == pytest.approx(3.0, abs=0.05)
+
+
+def test_merge_failure_raises(tmp_path):
+    bad = tmp_path / "bad.flac"
+    bad.write_bytes(b"not audio")
+    with pytest.raises(RuntimeError, match="ffmpeg"):
+        merge_tracks([bad], tmp_path / "m.flac")
+
+
+def test_slice_command_uses_input_seek(tmp_path):
+    cmd = build_slice_command(tmp_path / "t.flac", 12.5, 3.25, tmp_path / "o.flac")
+    i = cmd.index("-i")
+    assert cmd[cmd.index("-ss") + 1] == "12.500" and cmd.index("-ss") < i
+    assert cmd[cmd.index("-t") + 1] == "3.250"
+    assert cmd[-3:] == ["-c:a", "flac", str(tmp_path / "o.flac")]
+
+
+def test_split_produces_exact_durations(tmp_path):
+    track = tmp_path / "GM.flac"
+    _tone(track, 3.0)
+    out = tmp_path / "chunks"
+    files = split_tracks([track], [0.0, 1.25, 3.0], out)
+    assert [f.name for f in files] == ["GM-01.flac", "GM-02.flac"]
+    assert probe_duration_s(out / "GM-01.flac") == pytest.approx(1.25, abs=0.01)
+    assert probe_duration_s(out / "GM-02.flac") == pytest.approx(1.75, abs=0.01)
+    seg = AudioSegment.from_file(out / "GM-01.flac")
+    assert seg.frame_rate == 48000 and seg.channels == 2
+
+
+def test_split_skips_chunks_beyond_track_end(tmp_path):
+    long_t, short_t = tmp_path / "GM.flac", tmp_path / "Pen.flac"
+    _tone(long_t, 3.0)
+    _tone(short_t, 1.0)
+    files = split_tracks([long_t, short_t], [0.0, 1.5, 3.0], tmp_path / "c")
+    assert sorted(f.name for f in files) == ["GM-01.flac", "GM-02.flac", "Pen-01.flac"]
+
+
+def test_split_failure_raises(tmp_path):
+    bad = tmp_path / "GM.flac"
+    bad.write_bytes(b"not audio")
+    with pytest.raises(RuntimeError):
+        split_tracks([bad], [0.0, 1.0], tmp_path / "c")
+
+
+def test_chunk_audio_end_to_end_small(tmp_path):
+    tracks = tmp_path / "tracks"
+    tracks.mkdir()
+    _tone(tracks / "GM.flac", 4.0)
+    _tone(tracks / "Pen.flac", 4.0, freq=660)
+    cfg = ChunkingConfig(min_chunk_duration_s=1, max_chunk_duration_s=2)
+    files = chunk_audio(tracks, tmp_path / "chunked", tmp_path / "final" / "merged_audio.flac",
+                        tmp_path / "final" / "cut_points.txt", cfg)
+    assert files and all(f.exists() for f in files)
+    assert (tmp_path / "final" / "cut_points.txt").read_text().startswith("# Audio Cut Points")
+
+
+def test_chunk_audio_no_tracks_raises(tmp_path):
+    (tmp_path / "tracks").mkdir()
+    with pytest.raises(FileNotFoundError):
+        chunk_audio(tmp_path / "tracks", tmp_path / "c", tmp_path / "m.flac", tmp_path / "cp.txt")

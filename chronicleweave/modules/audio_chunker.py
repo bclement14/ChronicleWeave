@@ -1,16 +1,16 @@
-# chronicleweave/modules/treat_flac_tracks.py
+# chronicleweave/modules/audio_chunker.py
 
 import logging
 import numpy as np
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
+import subprocess
 from pydub import AudioSegment, silence
 from pydub.exceptions import CouldntDecodeError
 import os
 from tqdm import tqdm
 from dataclasses import dataclass, field
-from pydub.utils import mediainfo
 
 # --- Module Logger ---
 log = logging.getLogger(__name__)
@@ -69,131 +69,54 @@ def get_audio_files_from_folder(folder: Path, extension: str = "flac") -> List[P
     return audio_files
 
 
-def _merge_tracks_high_ram(speaker_files: List[Path], output_file: Path) -> None:
-    """Merge multiple speaker audio files into a single track (higher RAM usage)."""
-    log.info("Merging tracks (high RAM mode)...")
-    if not speaker_files:
-        log.warning("No speaker files provided for merging.")
-        # Create an empty file? Or raise error? For now, log warning.
-        # Creating an empty valid FLAC is non-trivial, maybe raise error is better.
-        raise ValueError("Cannot merge empty list of speaker files.")
+def _run_ffmpeg(cmd: List[str], what: str) -> None:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-5:])
+        raise RuntimeError(f"ffmpeg failed while {what} (exit {proc.returncode}): {tail}")
 
+
+def probe_duration_s(path: Path) -> float:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
     try:
-        log.debug(f"Loading track: {speaker_files[0]}")
-        merged = AudioSegment.from_file(speaker_files[0], format="flac")
-
-        # Overlay subsequent tracks
-        # Disable tqdm if logging level is DEBUG or lower to avoid interleaving
-        disable_tqdm = not sys.stdout.isatty() or log.getEffectiveLevel() <= logging.DEBUG
-        for track_path in tqdm(speaker_files[1:], desc="Merging tracks", disable=disable_tqdm):
-            log.debug(f"Loading and overlaying track: {track_path}")
-            track = AudioSegment.from_file(track_path, format="flac")
-            merged = merged.overlay(track)
-
-        log.info(f"Exporting merged track to {output_file}...")
-        output_file.parent.mkdir(parents=True, exist_ok=True) # Ensure output dir exists
-        merged.export(output_file, format="flac")
-        log.info(f"Merged track saved successfully.")
-
-    except CouldntDecodeError as e:
-        log.exception(f"Error decoding audio file during merge: {e}")
-        raise IOError(f"Failed to decode audio file: {e}") from e
-    except Exception as e:
-        log.exception(f"An unexpected error occurred during high RAM merge: {e}")
-        raise
+        value = float(proc.stdout.strip()) if proc.returncode == 0 else float("nan")
+    except ValueError:  # ffprobe prints "N/A" for non-audio files and still exits 0
+        value = float("nan")
+    if not (value > 0 and value != float("inf")):
+        raise RuntimeError(f"ffprobe could not read a valid duration for {path}: {proc.stdout.strip()} {proc.stderr.strip()}")
+    return value
 
 
-def _merge_tracks_low_ram(speaker_files: List[Path], output_file: Path, chunk_size_ms: int) -> None:
-    """Incrementally merge multiple audio files to reduce RAM usage."""
-    log.info("Merging tracks (low RAM mode)...")
-    if not speaker_files:
-        log.warning("No speaker files provided for merging.")
-        raise ValueError("Cannot merge empty list of speaker files.")
+def build_merge_command(tracks: Sequence[Path], output: Path) -> List[str]:
+    cmd: List[str] = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
+    for track in tracks:
+        cmd += ["-i", str(track)]
+    cmd += [
+        "-filter_complex", f"amix=inputs={len(tracks)}:duration=longest:normalize=0",
+        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(output),
+    ]
+    return cmd
 
-    try:
-        # Load tracks (still requires loading metadata, potentially some data)
-        # Disable tqdm if logging level is DEBUG or lower
-        disable_tqdm = not sys.stdout.isatty() or log.getEffectiveLevel() <= logging.DEBUG
-        log.debug("Loading track metadata...")
-        tracks = [AudioSegment.from_file(file, format="flac") for file in tqdm(speaker_files, desc="Loading tracks", disable=disable_tqdm)]
-        log.debug("Track metadata loaded.")
 
-        # Determine maximum length
-        max_length_ms = 0
-        for track in tracks:
-            max_length_ms = max(max_length_ms, len(track))
-        if max_length_ms == 0:
-            log.warning("All input tracks appear to be empty.")
-            # Export an empty file?
-            AudioSegment.silent(duration=0).export(output_file, format="flac")
-            return
+def merge_tracks(tracks: Sequence[Path], output: Path) -> None:
+    if not tracks:
+        raise ValueError("merge_tracks needs at least one track")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    log.info(f"Merging {len(tracks)} tracks with ffmpeg into {output} (16 kHz mono, summed)...")
+    _run_ffmpeg(build_merge_command(tracks, output), f"merging tracks into {output.name}")
 
-        log.info(f"Max track length: {max_length_ms / 1000:.2f}s. Processing in {chunk_size_ms}ms chunks.")
-        merged_output = AudioSegment.silent(duration=0)
-
-        # Process in chunks
-        for i in tqdm(range(0, max_length_ms, chunk_size_ms), desc="Merging chunks", disable=disable_tqdm):
-            # Create silent chunk of the correct duration for this iteration
-            current_chunk_duration = min(chunk_size_ms, max_length_ms - i)
-            chunk_overlay = AudioSegment.silent(duration=current_chunk_duration)
-
-            # Overlay the corresponding segment from each track
-            for track in tracks:
-                if i < len(track): # Check if track extends into this chunk
-                    segment = track[i : i + current_chunk_duration]
-                    chunk_overlay = chunk_overlay.overlay(segment)
-
-            merged_output += chunk_overlay # Append processed chunk
-
-        log.info(f"Exporting incrementally merged track to {output_file}...")
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        merged_output.export(output_file, format="flac")
-        log.info(f"Incrementally merged track saved successfully.")
-
-    except CouldntDecodeError as e:
-        log.exception(f"Error decoding audio file during low RAM merge: {e}")
-        raise IOError(f"Failed to decode audio file: {e}") from e
-    except Exception as e:
-        log.exception(f"An unexpected error occurred during low RAM merge: {e}")
-        raise
 
 # --- Silence Detection ---
 
-def _detect_silence_high_ram(audio_file: Path, config: ChunkingConfig) -> List[Tuple[float, float]]:
-    """Detect silence in an audio file (higher RAM usage)."""
-    log.info("Detecting silences (high RAM mode)...")
-    try:
-        log.debug(f"Loading audio file: {audio_file}")
-        audio = AudioSegment.from_file(audio_file, format="flac")
-        log.debug("Audio loaded, detecting silence...")
-        silent_ranges_ms = silence.detect_silence(
-            audio,
-            min_silence_len=config.min_silence_duration_ms,
-            silence_thresh=config.silence_threshold_dbfs
-        )
-        # Convert ms to seconds
-        silent_ranges_s = [(start / 1000, end / 1000) for start, end in silent_ranges_ms]
-        log.info(f"Detected {len(silent_ranges_s)} silent ranges.")
-        return silent_ranges_s
-    except CouldntDecodeError as e:
-        log.exception(f"Could not decode audio file for silence detection: {audio_file}")
-        raise IOError(f"Failed to decode audio file: {e}") from e
-    except Exception as e:
-        log.exception(f"Error during high RAM silence detection: {e}")
-        raise RuntimeError("Silence detection failed") from e
-
-
-def _detect_silence_low_ram(audio_file: Path, config: ChunkingConfig) -> List[Tuple[float, float]]:
+def detect_silence_windowed(audio_file: Path, config: ChunkingConfig, duration_s: float) -> List[Tuple[float, float]]:
     """Detect silence incrementally using partial loading (improved RAM usage)."""
     log.info("Detecting silences (low RAM mode - partial loading)...")
     try:
-        # --- Get duration using ffprobe via pydub.utils (lighter than loading) ---
-        log.debug(f"Getting audio duration for {audio_file} using mediainfo...")
-        info = mediainfo(str(audio_file)) # mediainfo expects string path
-        total_duration_s = float(info['duration'])
-        total_length_ms = int(total_duration_s * 1000)
-        log.info(f"Audio duration: {total_duration_s:.2f}s ({total_length_ms}ms)")
-        # --- End Duration Check ---
+        total_length_ms = int(duration_s * 1000)
+        log.info(f"Audio duration: {duration_s:.2f}s ({total_length_ms}ms)")
 
         if total_length_ms == 0:
             log.warning(f"Audio file {audio_file} is empty or has zero duration.")
@@ -225,12 +148,10 @@ def _detect_silence_low_ram(audio_file: Path, config: ChunkingConfig) -> List[Tu
                     start_second=chunk_start_ms / 1000.0, # from_file uses seconds for start
                     duration=load_duration_ms / 1000.0     # duration also in seconds
                 )
-            except EOFError:
-                log.warning(f"Reached EOF unexpectedly while reading chunk starting at {chunk_start_ms}ms. Stopping silence detection.")
-                break # Stop if we can't read a chunk
             except Exception as load_err:
-                 log.error(f"Error loading audio chunk starting at {chunk_start_ms}ms: {load_err}. Skipping chunk.")
-                 continue # Skip this chunk
+                raise RuntimeError(
+                    f"Could not read {audio_file} at {chunk_start_ms} ms for silence detection: {load_err}"
+                ) from load_err
 
             log.debug(f"Detecting silence in loaded chunk ({len(chunk)}ms)...")
             chunk_silences_ms = silence.detect_silence(
@@ -273,9 +194,6 @@ def _detect_silence_low_ram(audio_file: Path, config: ChunkingConfig) -> List[Tu
     except CouldntDecodeError as e:
         log.exception(f"Could not decode audio file {audio_file}: {e}")
         raise IOError(f"Failed to decode audio file {audio_file}") from e
-    except KeyError as e:
-         log.exception(f"Failed to get duration from mediainfo for {audio_file} - ffprobe/ffmpeg installed and working? Error: {e}")
-         raise RuntimeError(f"Could not get audio duration for {audio_file}") from e
     except Exception as e:
         log.exception(f"Error during low RAM silence detection: {e}")
         raise RuntimeError("Silence detection failed") from e
@@ -396,221 +314,51 @@ def write_cut_points(cut_points: List[float], output_file: Path) -> None:
 
 # --- Splitting ---
 
-def split_tracks(
-    speaker_files: List[Path],
-    cut_points_s: List[float],
-    output_dir: Path) -> None:
-    """
-    Split speaker tracks at the given timestamps (in seconds) and save them.
+def build_slice_command(track: Path, start_s: float, duration_s: float, output: Path) -> List[str]:
+    return [
+        "ffmpeg", "-nostdin", "-v", "error", "-y",
+        "-ss", f"{start_s:.3f}", "-t", f"{duration_s:.3f}", "-i", str(track),
+        "-c:a", "flac", str(output),
+    ]
 
-    Args:
-        speaker_files: List of Path objects for the original speaker audio files.
-        cut_points_s: List of cut point timestamps in seconds.
-        output_dir: Path object for the directory to save chunked files.
-    """
-    if not cut_points_s or len(cut_points_s) < 2:
-        log.error("Cannot split tracks: Need at least two cut points (start and end).")
-        raise ValueError("Invalid cut_points list provided for splitting.")
+
+def split_tracks(speaker_files: Sequence[Path], cut_points_s: Sequence[float], output_dir: Path) -> List[Path]:
+    if len(cut_points_s) < 2:
+        raise ValueError("Need at least two cut points (start and end) to split tracks.")
     if not speaker_files:
-        log.warning("No speaker files provided for splitting.")
-        return
+        raise FileNotFoundError("No speaker files to split.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    produced: List[Path] = []
+    for track in speaker_files:
+        track_duration = probe_duration_s(track)
+        for i in range(len(cut_points_s) - 1):
+            start, end = cut_points_s[i], min(cut_points_s[i + 1], track_duration)
+            if end - start <= 0.001:
+                log.info(f"{track.name}: chunk {i + 1:02d} starts after the track ends; not produced.")
+                continue
+            out = output_dir / f"{track.stem}-{i + 1:02d}.flac"
+            _run_ffmpeg(build_slice_command(track, start, end - start, out), f"cutting {out.name}")
+            produced.append(out)
+    log.info(f"Split {len(speaker_files)} tracks into {len(produced)} chunk files in {output_dir}.")
+    return produced
 
-    num_segments = len(cut_points_s) - 1
-    log.info(f"Splitting {len(speaker_files)} tracks into {num_segments} segments...")
-    output_dir.mkdir(parents=True, exist_ok=True) # Ensure creation again just before loop
-    disable_tqdm = not sys.stdout.isatty() or log.getEffectiveLevel() <= logging.DEBUG
-
-    for file_path in tqdm(speaker_files, desc="Splitting files", disable=disable_tqdm):
-        log.debug(f"Processing file for splitting: {file_path}")
-        try:
-            if not file_path.is_file():
-                 log.warning(f"Speaker file not found, skipping: {file_path}")
-                 continue
-            log.debug(f"Loading audio for {file_path.name}...")
-            audio = AudioSegment.from_file(file_path, format="flac")
-            log.debug(f"Audio loaded (Duration: {len(audio)/1000.0:.2f}s). Splitting into chunks...")
-
-            for i in range(num_segments):
-                start_s, end_s = cut_points_s[i], cut_points_s[i+1]
-                start_ms, end_ms = int(start_s * 1000), int(end_s * 1000)
-                start_ms, end_ms = max(0, start_ms), min(len(audio), end_ms)
-
-                if start_ms >= end_ms:
-                     log.warning(f"Skipping zero/negative duration chunk {i+1} for {file_path.name} ({start_ms}ms - {end_ms}ms)")
-                     continue
-
-                log.debug(f"Extracting chunk {i+1}: {start_ms}ms - {end_ms}ms from {file_path.name}")
-                segment = audio[start_ms:end_ms]
-
-                indice = f"{i+1:02d}"
-                output_filename = f"{file_path.stem}-{indice}.flac"
-                output_filepath = output_dir / output_filename
-
-                # Optional: Explicit delete before writing if overwrite is crucial
-                # if output_filepath.exists():
-                #     log.warning(f"Output chunk exists, overwriting: {output_filepath}")
-                #     try: output_filepath.unlink()
-                #     except OSError as del_e: log.error(f"Could not delete existing chunk {output_filepath}: {del_e}")
-
-                log.debug(f"Exporting chunk {i+1} to {output_filepath}")
-                segment.export(output_filepath, format="flac")
-                log.debug(f"Chunk {i+1} for {file_path.name} exported successfully.")
-
-        except CouldntDecodeError as e:
-            log.exception(f"Could not decode speaker file {file_path}, skipping splitting.")
-            continue
-        except Exception as e:
-            log.exception(f"Error splitting file {file_path}, skipping.")
-            continue
-
-    log.info(f"Splitting complete. Chunked files saved in {output_dir}")
-
-
-# --- Main Pipeline Function for this Module ---
 
 def chunk_audio(
     input_folder: Path,
     output_dir: Path,
     merged_file: Path,
     cut_points_file: Path,
-    use_low_ram: bool = False,
-    config: ChunkingConfig = DEFAULT_CHUNKING_CONFIG # Use default config if none provided
-    ) -> None:
-    """
-    Main pipeline function to chunk audio files based on silence detection.
-
-    Args:
-        input_folder: Path to the folder containing input FLAC speaker tracks.
-        output_dir: Path to the folder where chunked FLAC files will be saved.
-        merged_file: Path to save the merged audio file of all speakers.
-        cut_points_file: Path to save the text file listing cut points.
-        use_low_ram: If True, use incremental methods to save RAM.
-        config: Configuration settings for chunking.
-    """
-    log.info("Starting audio chunking pipeline...")
-    log.info(f"Input folder: {input_folder}")
-    log.info(f"Output chunk folder: {output_dir}")
-    log.info(f"Merged audio output: {merged_file}")
-    log.info(f"Cut points file: {cut_points_file}")
-    log.info(f"Using low RAM mode: {use_low_ram}")
-    log.info(f"Chunking configuration: {config}")
-
-    try:
-        # 1. Get input files
-        speaker_files = get_audio_files_from_folder(input_folder)
-        if not speaker_files:
-            log.warning(f"No FLAC files found in {input_folder}. Audio chunking cannot proceed.")
-            return # Exit gracefully if no input
-
-        # 2. Merge tracks
-        log.info("Merging speaker tracks...")
-        if use_low_ram:
-            _merge_tracks_low_ram(speaker_files, merged_file, config.incremental_chunk_size_ms)
-        else:
-            _merge_tracks_high_ram(speaker_files, merged_file)
-        log.info("Track merging complete.")
-
-        # Ensure merged file exists before proceeding
-        if not merged_file.is_file():
-             raise IOError(f"Merged audio file was not created successfully at {merged_file}")
-
-        # Get duration of merged file for cut point determination
-        try:
-             merged_audio = AudioSegment.from_file(merged_file, format="flac")
-             audio_duration_s = len(merged_audio) / 1000.0
-             log.info(f"Merged audio duration: {audio_duration_s:.2f} seconds.")
-        except Exception as e:
-             log.exception(f"Failed to get duration of merged file {merged_file}")
-             raise IOError("Could not read merged audio file duration.") from e
-
-        # 3. Detect Silence
-        log.info("Detecting silence in merged track...")
-        if use_low_ram:
-            silence_timestamps = _detect_silence_low_ram(merged_file, config)
-        else:
-            silence_timestamps = _detect_silence_high_ram(merged_file, config)
-        log.info("Silence detection complete.")
-
-        # 4. Determine Cut Points
-        cut_points = determine_cut_points(silence_timestamps, audio_duration_s, config)
-
-        # 5. Write Cut Points
-        write_cut_points(cut_points, cut_points_file)
-
-        # 6. Split Tracks
-        split_tracks(speaker_files, cut_points, output_dir)
-
-        log.info("Audio chunking pipeline completed successfully.")
-
-    except (FileNotFoundError, ValueError, IOError, RuntimeError) as e:
-        # Catch specific, expected errors from steps
-        log.exception(f"Audio chunking pipeline failed: {e}")
-        # Re-raise or handle as needed by the calling pipeline
-        raise
-    except Exception as e:
-        # Catch any unexpected errors
-        log.exception(f"An unexpected error occurred during audio chunking: {e}")
-        raise RuntimeError("Unexpected failure during audio chunking") from e
-
-
-# --- Example Usage ---
-def run_chunking_example():
-    """Example function to demonstrate running the chunk_audio pipeline."""
-    print("\n--- Running Audio Chunking Example ---")
-    # Configure logging for example
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    log.setLevel(logging.INFO) # Ensure module log is also at INFO
-
-    # Define test paths relative to current dir
-    base_test_dir = Path("./temp_chunking_test")
-    input_dir = base_test_dir / "input_tracks"
-    output_dir = base_test_dir / "output_chunks"
-    final_dir = base_test_dir / "final_outputs"
-    merged_file = final_dir / "merged_test.flac"
-    cut_points_file = final_dir / "cuts_test.txt"
-
-    # Create dummy input files (requires pydub to create silence)
-    try:
-        print(f"Creating dummy input files in {input_dir}...")
-        input_dir.mkdir(parents=True, exist_ok=True)
-        final_dir.mkdir(parents=True, exist_ok=True) # Create final dir for outputs
-
-        # Create 2 dummy silent FLAC files of different lengths for testing
-        silence_10s = AudioSegment.silent(duration=10000) # 10 seconds
-        silence_15s = AudioSegment.silent(duration=15000) # 15 seconds
-        silence_10s.export(input_dir / "speakerA.flac", format="flac")
-        silence_15s.export(input_dir / "speakerB.flac", format="flac")
-        print("Dummy files created.")
-
-        # Define chunking configuration (using defaults here)
-        config = ChunkingConfig(
-             min_chunk_duration_s=5, # Shorter durations for test
-             max_chunk_duration_s=12
-        )
-
-        # Run the chunking process
-        print("\nRunning chunk_audio function...")
-        chunk_audio(
-            input_folder=input_dir,
-            output_dir=output_dir,
-            merged_file=merged_file,
-            cut_points_file=cut_points_file,
-            use_low_ram=False, # Use high RAM for simpler test case
-            config=config
-        )
-        print("\nChunking example finished successfully.")
-        print(f"Check outputs in: {output_dir}, {final_dir}")
-
-    except Exception as e:
-        print(f"\nChunking example failed: {e}")
-        log.exception("Chunking example execution failed")
-    finally:
-        # Clean up dummy files/dirs
-        # print("\nCleaning up test directories...")
-        # if base_test_dir.exists():
-        #     shutil.rmtree(base_test_dir)
-        # print("Cleanup complete.")
-        pass # Keep files for inspection
-
-if __name__ == "__main__":
-    run_chunking_example()
+    config: ChunkingConfig = DEFAULT_CHUNKING_CONFIG,
+) -> List[Path]:
+    speaker_files = sorted(get_audio_files_from_folder(input_folder))
+    if not speaker_files:
+        raise FileNotFoundError(f"No FLAC tracks in {input_folder}; nothing to chunk.")
+    merge_tracks(speaker_files, merged_file)
+    duration_s = probe_duration_s(merged_file)
+    log.info(f"Merged audio duration: {duration_s:.2f} s")
+    silences = detect_silence_windowed(merged_file, config, duration_s)
+    cut_points = determine_cut_points(silences, duration_s, config)
+    if len(cut_points) < 2:
+        raise RuntimeError("No usable cut points were determined.")
+    write_cut_points(cut_points, cut_points_file)
+    return split_tracks(speaker_files, cut_points, output_dir)
