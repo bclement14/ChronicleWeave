@@ -231,12 +231,6 @@ def test_write_cut_points_cannot_write(tmp_path: Path):
     with pytest.raises((IOError, OSError)):
         write_cut_points(cut_points, output_file_as_dir)
 
-# --- TODO: Write Integration tests or tests for pydub dependent functions ---
-# - _merge_tracks_high_ram / _merge_tracks_low_ram
-# - _detect_silence_high_ram / _detect_silence_low_ram
-# - split_tracks
-# - chunk_audio (main function)
-
 # --- ffmpeg-based merge and slicing (spec 4.4) ---
 import subprocess
 import numpy as np

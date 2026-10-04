@@ -62,13 +62,9 @@ ChronicleWeave leverages the powerful **[WhisperX](https://github.com/m-bain/whi
 
 1.  **Install Docker Engine:** Follow instructions at [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/).
 2.  **Configure GPU Access (Recommended):** For significantly faster transcription, ensure Docker can access your NVIDIA GPU. See [NVIDIA Container Toolkit Installation Guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-3.  **Build the Image:** From the project root directory (containing the `Dockerfile`), run:
-    ```bash
-    docker build -t chronicleweave-whisperx .
-    ```
-    _(This uses the included Dockerfile based on official NVIDIA CUDA images and installs the necessary WhisperX version)._
+3.  **Use the existing image:** Step 2 runs the `chronicleweave-whisperx` image that is already on the machine. The `Dockerfile` only documents what that image contains (pinned versions); it has not been build-tested, so do not run `docker build` over the working image.
 
-Once built, the `run_pipeline` function will use the `chronicleweave-whisperx` image automatically for Step 2.
+`chronicleweave-batch` checks the image once (`docker image inspect chronicleweave-whisperx`) before it processes any session, when step 2 is in the range and `--no-whisperx` is not given; if the check fails it exits with 1 and processes nothing.
 
 ---
 
@@ -85,11 +81,13 @@ uv pip install --python ~/.venvs/chronicleweave/bin/python -e ".[dev]"
 
 This installs the `chronicleweave` and `chronicleweave-batch` commands in `~/.venvs/chronicleweave/bin/`.
 
-### 2. Build the WhisperX Docker image
+### 2. Check the WhisperX Docker image
 
 ```bash
-docker build -t chronicleweave-whisperx .
+docker image inspect chronicleweave-whisperx > /dev/null && echo "image present"
 ```
+
+The pipeline uses this existing image; see "WhisperX Transcription via Docker" above (do not rebuild it from the `Dockerfile`).
 
 ### 3. Configure `.env`
 
@@ -98,11 +96,13 @@ Copy `.env.example` to `.env` (gitignored) and edit it:
 - `CW_SPEAKERS`: comma-separated `craig_username:Tag` pairs. Tags are the speaker names used in the script.
 - `CW_IGNORE_TRACKS`: tracks whose username contains one of these words (case-insensitive) are dropped, e.g. `Spoticord`.
 
-Steps 1-8 need no API key. The `.env` is looked up in the current folder and its parents, then the repository root; `--env-file PATH` uses a specific file, and values already set in the shell win.
+Steps 1-8 need no API key. The `.env` is looked up in the current folder and its parents, then the repository root; `--env-file PATH` uses a specific file, and values already set in the shell win. Both commands print one line naming the file they loaded (or "no .env found") and the speaker Tags from `CW_SPEAKERS`.
+
+Tags must be plain file names (no `/`, `\`, `..`, no leading `.`): each track becomes `tracks/<Tag>.flac`.
 
 ### 4. Prepare a session folder
 
-Put the Craig archive (`craig-*.flac.zip`) in the session folder, or the speaker `.flac` files in a `tracks/` subfolder:
+Put the Craig archive (`craig-*.flac.zip`) in the session folder, or the speaker `.flac` files (lowercase extension) in a `tracks/` subfolder:
 
 ```
 session26/
@@ -117,13 +117,16 @@ One session:
 chronicleweave -b /path/to/session26 [--steps 1-8]
 ```
 
+The folder given with `-b` must exist; it is never created.
+
 Every `session<N>` folder under a root, one after another (sessions already done are skipped; a failure does not stop the batch):
 
 ```bash
-chronicleweave-batch /path/to/Sessions [--only 13,15-19] [--force]
+chronicleweave-batch /path/to/Sessions [--only 13,15-19]
+chronicleweave-batch /path/to/Sessions --force --only 14      # re-process a session that is already done
 ```
 
-The batch prints a summary (OK / FAILED / SKIPPED, duration, log) and exits with 1 if any session failed. Run the same command again to resume.
+The batch prints a summary (OK / FAILED / SKIPPED, duration, log) and exits with 1 if any session failed. Run the same command again to resume. It also exits with 1, without processing anything, when the root folder does not exist, when no session is selected (e.g. `--only 35` with no `session35`), or when the Docker image check fails. `--force` re-processes sessions that are already done and requires `--only`, so a finished session is only redone when it is named.
 
 Both commands accept `--steps`, `--log-level`, `--verbose`, `--env-file`, `--no-whisperx`, `--diarize`, `--whisperx-model` (name or local CTranslate2 folder, default `large-v3`) and `--whisperx-language` (default `fr`). Exit code is 0 on success, 1 on failure.
 
@@ -146,11 +149,11 @@ Both commands accept `--steps`, `--log-level`, `--verbose`, `--env-file`, `--no-
 | 8    | Split the script into chunks                                                                    | `final_outputs/script_chunks/`                |
 | 9    | Optional: LLM processing through an API (needs a key, off by default)                           | configured LLM output                         |
 
-Step 0 runs automatically before step 1 unless `--no-prepare-tracks` is given.
+Step 0 runs before step 1. By default it extracts the archive, renames tracks to their Tags and deletes ignored tracks from `tracks/`. With `--no-prepare-tracks` it only validates `tracks/`: every track must already be `<Tag>.flac` for a Tag in `CW_SPEAKERS` (which is still required); nothing is extracted, renamed or deleted. A track with an uppercase extension (`GM.FLAC`) fails step 0. `--input-folder` must name a folder inside the session folder.
 
-**Outputs.** Each run writes `pipeline.log` in the session folder. A successful run writes the completion marker `final_outputs/.chronicleweave_done.json`; the batch treats a session as done when this marker exists, or, for sessions processed before the marker existed, when `final_script.txt` exists and no `final_outputs/.chronicleweave_running` marker is left behind by a crashed run.
+**Outputs.** Each run writes `pipeline.log` in the session folder. Only a successful run that includes step 7 writes the completion marker `final_outputs/.chronicleweave_done.json`; a run of only step 8 or 9 leaves it as it is. A run starting at step 7 or earlier removes any completion marker and writes `final_outputs/.chronicleweave_running` before deleting old outputs, and removes it only when it writes the completion marker, so a crashed run (or one that stops before step 7) leaves it behind. The batch treats a session as done when the completion marker exists, or, for sessions processed before the marker existed, when `final_script.txt` exists and there is no `.chronicleweave_running` marker.
 
-**Re-running.** A run starting at step k first removes the outputs of steps k to 8, then regenerates them. `tracks/` and the Craig archives are never deleted.
+**Re-running.** A run starting at step k first removes the outputs of steps k to 8, then regenerates them. Before deleting anything it checks the inputs it needs from earlier steps; a run starting at steps 3-7 also checks that the per-chunk folders it reuses (`wx_output/`, `json_files/`, `srt_files/`) hold exactly one file per chunk, and fails otherwise. `tracks/`, the Craig archives and any folder holding one are never deleted.
 
 ---
 
@@ -159,7 +162,7 @@ Step 0 runs automatically before step 1 unless `--no-prepare-tracks` is given.
 If you need to run the WhisperX transcription step manually outside the pipeline:
 
 1.  Ensure your chunked audio files (e.g., `.flac`) are in a subdirectory (e.g., `chunked_tracks`).
-2.  Build the image: `docker build -t chronicleweave-whisperx .`
+2.  Use the existing `chronicleweave-whisperx` image (see above; the `Dockerfile` is not build-tested).
 3.  Run the container:
 
     ```bash
@@ -191,9 +194,11 @@ Place the resulting JSON files from `wx_output/` into the expected directory for
 ## 📂 Example Final Folder Structure
 
 ```
-your_session_name/
-├── tracks/                     # Input speaker audio files
-├── chunked_tracks/             # Output from Step 1
+session26/
+├── craig-XXXX.flac.zip         # Craig archive (input, never modified or deleted)
+├── pipeline.log                # Log of the last run (overwritten by each run)
+├── tracks/                     # Speaker tracks <Tag>.flac (Step 0; never deleted)
+├── chunked_tracks/             # Output from Step 1 (<Tag>-NN.flac)
 ├── wx_output/                  # Output from Step 2 (WhisperX JSON)
 ├── json_files/                 # Output from Step 3 (Corrected JSON)
 ├── srt_files/                  # Output from Step 4 (Chunked SRTs)
@@ -202,7 +207,10 @@ your_session_name/
     ├── cut_points.txt          # Silence cut points (from Step 1)
     ├── merged_transcript.srt   # Output from Step 5
     ├── cleaned_transcript.srt  # Output from Step 6
-    └── final_script.txt        # Output from Step 7
+    ├── final_script.txt        # Output from Step 7
+    ├── script_chunks/          # Output from Step 8 (script_chunk_NN.txt)
+    ├── .chronicleweave_done.json  # Completion marker (successful run that included Step 7)
+    └── .chronicleweave_running    # Left by a run that started at step <= 7 and has not completed step 7
 ```
 
 ---
