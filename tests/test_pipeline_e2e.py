@@ -225,3 +225,29 @@ def test_tracks_folder_outside_session_refused_before_step0(synthetic_session, f
     assert music.exists()
     assert not list(synthetic_session.glob("*.flac"))  # nothing extracted into the session root
     assert not (synthetic_session / "tracks").exists()
+
+
+# --- final review F5: outputs reused from an earlier run must be complete before anything is deleted ---
+
+@pytest.mark.parametrize("steps,remove,extra", [
+    ("5-7", "srt_files/GM-01.srt", None),
+    ("3-7", "wx_output/GM-01.json", None),
+    ("4-7", "json_files/GM-01.json", None),
+    ("6-7", "json_files/GM-01.json", None),
+    ("7", "srt_files/GM-01.srt", None),
+    ("5-7", None, "srt_files/Ghost-01.srt"),
+])
+def test_incomplete_reused_outputs_fail_before_cleanup(synthetic_session, steps, remove, extra):
+    _run(synthetic_session)
+    final = synthetic_session / "final_outputs"
+    (final / DONE_MARKER_NAME).unlink()  # a session that has not completed yet
+    if remove:
+        (synthetic_session / remove).unlink()
+    if extra:
+        (synthetic_session / extra).write_text("", encoding="utf-8")
+    with patch("chronicleweave.pipeline.run_whisperx_docker", side_effect=_fake_whisperx):
+        with pytest.raises(PipelineError, match="GM-01|Ghost-01"):
+            run_pipeline(base_path=str(synthetic_session), steps_to_run=steps, log_level="WARNING")
+    assert not (final / DONE_MARKER_NAME).exists()
+    assert not (final / RUNNING_MARKER_NAME).exists()  # failed before the run-in-progress marker and cleanup
+    assert (final / "merged_transcript.srt").exists() and (final / "final_script.txt").exists()

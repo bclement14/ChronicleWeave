@@ -249,3 +249,23 @@ def test_tracks_folder_outside_session_refused(tmp_path, cfg):
     with pytest.raises(TrackPreparationError, match="inside"):
         prepare_tracks(session, cfg, "../session2/tracks")
     assert music.exists()
+
+
+# --- uppercase extensions (final review F7) ---
+
+@pytest.mark.parametrize("rename", [True, False])
+def test_uppercase_extension_in_tracks_fails(tmp_path, cfg, rename):
+    tracks = tmp_path / "tracks"
+    tracks.mkdir()
+    (tracks / "GM.FLAC").write_bytes(b"gm")
+    (tracks / "Titar.flac").write_bytes(b"t")
+    (tracks / "3-Spoticord_Music_4270.flac").write_bytes(b"music")
+    with pytest.raises(TrackPreparationError, match=r"GM\.FLAC"):
+        prepare_tracks(tmp_path, cfg, rename=rename)
+    assert (tracks / "GM.FLAC").exists() and (tracks / "3-Spoticord_Music_4270.flac").exists()  # nothing touched
+
+
+def test_uppercase_archive_entry_extracted_as_lowercase(tmp_path, cfg):
+    _zip(tmp_path, {"1-player_one.FLAC": b"aa"})
+    prepare_tracks(tmp_path, cfg)
+    assert [p.name for p in (tmp_path / "tracks").iterdir()] == ["Titar.flac"]

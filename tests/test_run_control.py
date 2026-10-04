@@ -13,6 +13,7 @@ from chronicleweave.pipeline import (
     check_coverage,
     check_tracks_folder,
     check_final_script,
+    check_reused_outputs,
     check_step_inputs,
     cleanup_outputs,
     expected_chunk_stems,
@@ -282,3 +283,45 @@ def test_cleanup_guard_case_variant_containing_tracks(tmp_path):
     with pytest.raises(PipelineError, match="tracks"):
         cleanup_outputs(cfg, 8)
     assert (tmp_path / "audio" / "tracks" / "GM.flac").exists()
+
+
+# --- final review F5: reused per-chunk folders are checked against the chunk files before cleanup ---
+
+def _reuse_layout(tmp_path, srts=("GM-01", "Pen-01"), jsons=("GM-01", "Pen-01"), wx=("GM-01", "Pen-01")):
+    _put(tmp_path, "chunked_tracks/GM-01.flac", "chunked_tracks/Pen-01.flac")
+    _put(tmp_path, *(f"srt_files/{s}.srt" for s in srts), *(f"json_files/{s}.json" for s in jsons),
+         *(f"wx_output/{s}.json" for s in wx))
+    return PipelineConfig(base_path=tmp_path)
+
+
+@pytest.mark.parametrize("steps,kw,ok", [
+    (StepRange(5, 6), {"srts": ("GM-01",)}, False),
+    (StepRange(6, 6), {"srts": ("GM-01",)}, True),     # no step reads srt_files, no final gate
+    (StepRange(6, 7), {"srts": ("GM-01",)}, False),
+    (StepRange(7, 8), {"jsons": ("GM-01",)}, False),
+    (StepRange(4, 4), {"jsons": ("GM-01", "Pen-01", "Old-01")}, False),
+    (StepRange(3, 3), {"wx": ("GM-01",)}, False),
+    (StepRange(3, 7), {"srts": (), "jsons": ()}, True),  # made by this run, checked after their step
+    (StepRange(8, 9), {"srts": ()}, True),
+])
+def test_check_reused_outputs(tmp_path, steps, kw, ok):
+    cfg = _reuse_layout(tmp_path, **kw)
+    if ok:
+        check_reused_outputs(cfg, steps)
+    else:
+        with pytest.raises(PipelineError, match="earlier run") as err:
+            check_reused_outputs(cfg, steps)
+        assert err.value.step == steps.first
+
+
+def test_check_reused_outputs_manual_mode(tmp_path):
+    _put(tmp_path, "wx_output/GM-01.json", "wx_output/Pen-01.json", "json_files/GM-01.json")
+    with pytest.raises(PipelineError, match="Pen-01"):
+        check_reused_outputs(PipelineConfig(base_path=tmp_path, run_whisperx=False), StepRange(4, 7))
+
+
+def test_step_inputs_start_5_needs_chunk_files(tmp_path):
+    cfg = PipelineConfig(base_path=tmp_path)
+    _put(tmp_path, "srt_files/GM-01.srt", "final_outputs/cut_points.txt")
+    with pytest.raises(PipelineError, match="chunked_tracks"):
+        check_step_inputs(cfg, 5, 6)

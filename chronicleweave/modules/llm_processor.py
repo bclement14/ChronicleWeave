@@ -135,7 +135,7 @@ def _call_gemini_api(
 ) -> str:
     """Call Gemini via the unified google-genai SDK and return generated text.
 
-    Raises RuntimeError on API/blocked failures, ValueError on bad inputs.
+    Raises RuntimeError on API/blocked failures or empty text, ValueError on bad inputs.
     """
     log.info(f"Calling Gemini API with model: {model_name}")
     log.debug(f"Prompt content (first 200 chars): {prompt_content[:200]}...")
@@ -177,7 +177,15 @@ def _call_gemini_api(
         candidate = response.candidates[0]
         finish = getattr(candidate, "finish_reason", None)
         finish_name = getattr(finish, "name", str(finish) if finish else "UNKNOWN")
-        log.warning(f"Gemini '{model_name}' returned empty text. Finish reason: {finish_name}")
+        log.error(f"Gemini '{model_name}' returned empty text. Finish reason: {finish_name}")
+        raise RuntimeError(f"Gemini '{model_name}' returned empty text (finish reason: {finish_name}).")
+    return text
+
+
+def _require_text(text: str, what: str) -> str:
+    """An empty generation is a failure: raise before any output file is written or overwritten."""
+    if not (text or "").strip():
+        raise RuntimeError(f"the model returned empty text for the {what}")
     return text
 
 
@@ -249,10 +257,10 @@ def process_with_llm(
         }
         try:
             formatted_prompt_b = prompt_template_b.format(**prompt_b_params)
-            current_session_concise_summary_text = _call_gemini_api(
+            current_session_concise_summary_text = _require_text(_call_gemini_api(
                 api_key, llm_config.model_name_summary, formatted_prompt_b,
                 llm_config.max_output_tokens_summary, llm_config.temperature, llm_config.safety_settings,
-            )
+            ), "session summary")
             (output_dir / llm_config.output_summary_filename).write_text(
                 current_session_concise_summary_text, encoding="utf-8"
             )
@@ -277,10 +285,10 @@ def process_with_llm(
         }
         try:
             formatted_prompt_a = prompt_template_a.format(**prompt_a_params)
-            narrative_text = _call_gemini_api(
+            narrative_text = _require_text(_call_gemini_api(
                 api_key, llm_config.model_name_narrative, formatted_prompt_a,
                 llm_config.max_output_tokens_narrative, llm_config.temperature, llm_config.safety_settings,
-            )
+            ), "session narrative")
             (output_dir / llm_config.output_narrative_filename).write_text(narrative_text, encoding="utf-8")
             log.info(f"Current session narrative saved to: {output_dir / llm_config.output_narrative_filename}")
         except KeyError as e:
@@ -310,10 +318,10 @@ def process_with_llm(
             }
             try:
                 formatted_prompt_c = prompt_template_c.format(**prompt_c_params)
-                new_cumulative_meta_summary_text = _call_gemini_api(
+                new_cumulative_meta_summary_text = _require_text(_call_gemini_api(
                     api_key, llm_config.model_name_summary, formatted_prompt_c,
                     llm_config.max_output_tokens_cumulative, llm_config.temperature, llm_config.safety_settings,
-                )
+                ), "cumulative campaign summary")
                 if cumulative_summary_file_path.is_file():
                     backup_path = cumulative_summary_file_path.with_suffix(
                         cumulative_summary_file_path.suffix + ".bak"

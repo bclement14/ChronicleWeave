@@ -189,6 +189,13 @@ def prepare_tracks(
         str(tracks_resolved).casefold() == str(session_resolved).casefold()
     ):
         raise TrackPreparationError(f"The tracks folder {tracks} must be a folder inside the session folder {session_path}.")
+    if tracks.is_dir():
+        odd = sorted(p.name for p in tracks.iterdir()
+                     if p.suffix.lower() == ".flac" and p.suffix != ".flac" and p.is_file())
+        if odd:
+            raise TrackPreparationError(
+                f"Tracks with an uppercase extension in {tracks}: {odd}. Rename them to end in lowercase '.flac'."
+            )
     result = PrepareResult()
     leftover = tracks / _EXTRACT_TMP
     if rename and (leftover.exists() or leftover.is_symlink()):

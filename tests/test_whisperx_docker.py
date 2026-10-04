@@ -85,3 +85,64 @@ def test_nonzero_exit_raises(tmp_path):
     with patch("chronicleweave.pipeline.build_whisperx_command", return_value=["sh", "-c", "exit 3"]):
         with pytest.raises(RuntimeError, match="exit code 3"):
             run_whisperx_docker(tmp_path, "chunked_tracks", cfg)
+
+
+# --- final review F8: a named container, stopped and reaped when streaming fails ---
+
+import os
+import re
+import subprocess
+import time
+
+from chronicleweave import pipeline as pipeline_module
+from chronicleweave.pipeline import container_name
+
+
+def test_container_has_unique_name(tmp_path):
+    files = _session(tmp_path)
+    cfg = PipelineConfig(base_path=tmp_path, whisperx_cache_dir=tmp_path / "c")
+    cmd = build_whisperx_command(tmp_path, files, cfg, environ={})
+    i = cmd.index("--name")
+    assert cmd[i + 1] == f"chronicleweave-{tmp_path.name}-{os.getpid()}" == container_name(tmp_path)
+    assert i < cmd.index(cfg.whisperx_docker_image)
+
+
+def test_container_name_is_valid_for_docker():
+    name = container_name(Path("/data/sessions/session5 - Copie (2)"))
+    assert re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+", name)
+    assert name.startswith("chronicleweave-session5") and name.endswith(f"-{os.getpid()}")
+
+
+@pytest.mark.parametrize("exc", [OSError("stdout broke"), KeyboardInterrupt()])
+def test_streaming_failure_stops_container_and_reaps_client(tmp_path, exc):
+    _session(tmp_path)
+    cfg = PipelineConfig(base_path=tmp_path, whisperx_cache_dir=tmp_path / "c")
+    procs = []
+    real_popen = subprocess.Popen
+
+    def spy(*a, **k):
+        procs.append(real_popen(*a, **k))
+        return procs[-1]
+
+    started = time.monotonic()
+    with patch("chronicleweave.pipeline.build_whisperx_command", return_value=["sh", "-c", "echo started; exec sleep 30"]), \
+            patch("chronicleweave.pipeline.subprocess.Popen", side_effect=spy), \
+            patch("chronicleweave.pipeline.subprocess.run") as run_mock, \
+            patch.object(pipeline_module.docker_log, "info", side_effect=exc):
+        with pytest.raises(type(exc)):
+            run_whisperx_docker(tmp_path, "chunked_tracks", cfg)
+    assert time.monotonic() - started < 15  # the client was terminated, not waited for 30 s
+    assert any(c.args[0][:2] == ["docker", "stop"] and c.args[0][-1] == container_name(tmp_path)
+               for c in run_mock.call_args_list)
+    assert procs[0].returncode is not None  # reaped
+    assert procs[0].stdout.closed
+
+
+def test_docker_stop_failure_is_ignored(tmp_path):
+    _session(tmp_path)
+    cfg = PipelineConfig(base_path=tmp_path, whisperx_cache_dir=tmp_path / "c")
+    with patch("chronicleweave.pipeline.build_whisperx_command", return_value=["sh", "-c", "echo started; exec sleep 30"]), \
+            patch("chronicleweave.pipeline.subprocess.run", side_effect=OSError("no docker")), \
+            patch.object(pipeline_module.docker_log, "info", side_effect=OSError("stdout broke")):
+        with pytest.raises(OSError, match="stdout broke"):  # the original error, not the cleanup one
+            run_whisperx_docker(tmp_path, "chunked_tracks", cfg)

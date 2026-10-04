@@ -1147,3 +1147,24 @@ def test_process_segment_moderate_density_and_long(default_config):
     # Check individual segment durations are now likely reasonable
     for seg in processed_segments:
         assert seg["end"] - seg["start"] <= default_config.max_segment_duration + 0.1 # Allow small tolerance
+
+# --- final review F6: a segment with text but no word timings is kept as it is ---
+
+@pytest.mark.parametrize("words", [[], None])
+def test_process_segment_keeps_text_without_words(default_config, words):
+    seg = {"start": 3.0, "end": 4.5, "text": " bonjour à tous "}
+    if words is not None:
+        seg["words"] = words
+    assert process_segment(seg, default_config) == [
+        {"start": 3.0, "end": 4.5, "text": "bonjour à tous", "words": []}]
+
+
+def test_process_segment_wordless_and_textless_is_dropped(default_config):
+    assert process_segment({"start": 1.0, "end": 2.0, "text": "  ", "words": []}, default_config) == []
+
+
+def test_text_only_segment_is_never_merged(default_config):
+    with_words = create_segment(start=1.0, end=2.0, text="Segment one")
+    text_only = Segment(start=2.1, end=3.0, text="sans mots", words=[])
+    assert should_merge_segments(with_words, text_only, default_config) is False
+    assert should_merge_segments(text_only, with_words, default_config) is False

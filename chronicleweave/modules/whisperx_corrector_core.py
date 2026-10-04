@@ -919,6 +919,9 @@ def should_merge_segments(
     curr_words = current_segment.get("words", [])
     prev_text = prev_segment.get("text", "").strip()
 
+    if not prev_words or not curr_words:
+        return False  # merge_segments rebuilds the text from words; a text-only segment would lose its text
+
     if curr_start - prev_end > config.merge_time_gap_threshold:
         return False
     if prev_text and is_sentence_boundary(prev_text):
@@ -1022,7 +1025,8 @@ def process_segment(segment: Segment, config: WhisperXCorrectorConfig) -> List[S
 
     Returns:
         A list of 0, 1, or more processed segment dictionaries. Returns empty
-        if the segment becomes invalid during processing.
+        if the segment becomes invalid during processing. A segment with text but
+        no words is returned unchanged (text stripped, words=[]).
 
     Example:
         >>> cfg = WhisperXCorrectorConfig()
@@ -1033,6 +1037,12 @@ def process_segment(segment: Segment, config: WhisperXCorrectorConfig) -> List[S
     original_start = segment.get("start", 0.0)
     original_end = segment.get("end", 0.0)
     if not segment.get("words"):
+        text = str(segment.get("text") or "").strip()
+        if text:
+            # WhisperX sometimes gives a segment's text without word timings: keep the speech as it is,
+            # with the segment's own times, rather than dropping it.
+            log.info(f"Seg {original_start:.2f}-{original_end:.2f} has text but no word timings; kept as is.")
+            return [Segment(start=original_start, end=original_end, words=[], text=text)]
         log.warning(f"Seg {original_start:.2f}-{original_end:.2f} has no words.")
         return []
 

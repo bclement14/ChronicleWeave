@@ -186,6 +186,12 @@ def redact_command(cmd: Sequence[str]) -> str:
     return " ".join(parts)
 
 
+def container_name(session_path: Path) -> str:
+    """A name unique to this session and process, so a failed run can stop its own container."""
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", Path(session_path).name).strip("-_.") or "session"
+    return f"chronicleweave-{safe}-{os.getpid()}"
+
+
 def build_whisperx_command(
     session_path: Path,
     chunk_files: Sequence[Path],
@@ -217,8 +223,8 @@ def build_whisperx_command(
         if not hf_token:
             raise ValueError("Diarization enabled, but Hugging Face token (HF_TOKEN) missing.")
         whisperx_args += ["--diarize", "--hf_token", hf_token]
-    return ["docker", "run", "--gpus", "all", "--rm", "--ipc=host", *mounts, *env_args,
-            config.whisperx_docker_image, *whisperx_args]
+    return ["docker", "run", "--gpus", "all", "--rm", "--name", container_name(session_path), "--ipc=host",
+            *mounts, *env_args, config.whisperx_docker_image, *whisperx_args]
 
 # --- Helper Functions ---
 
@@ -401,7 +407,7 @@ def _step_inputs(config: PipelineConfig, step: int) -> List[_StepInput]:
         2: [expected],
         3: [wx_json, expected],
         4: [corrected, expected],
-        5: [_StepInput(4, config.get_full_path("srt_folderName"), "*.srt", "SRT files"), cut_points],
+        5: [_StepInput(4, config.get_full_path("srt_folderName"), "*.srt", "SRT files"), cut_points, expected],
         6: [_StepInput(5, final / config.merged_transcript_filename, None, "merged transcript")],
         7: [_StepInput(6, final / config.cleaned_transcript_filename, None, "cleaned transcript"),
             expected, corrected],
@@ -447,12 +453,44 @@ def expected_chunk_stems(config: PipelineConfig, step: int = 2) -> List[str]:
     return stems
 
 
-def check_coverage(step: int, folder: Path, expected: Sequence[str], suffix: str) -> None:
+def _coverage_gaps(folder: Path, expected: Sequence[str], suffix: str) -> Tuple[List[str], List[str]]:
     found = {p.stem for p in folder.glob(f"*{suffix}")} if folder.is_dir() else set()
-    missing = sorted(set(expected) - found)
-    extra = sorted(found - set(expected))
+    return sorted(set(expected) - found), sorted(found - set(expected))
+
+
+def check_coverage(step: int, folder: Path, expected: Sequence[str], suffix: str) -> None:
+    missing, extra = _coverage_gaps(folder, expected, suffix)
     if missing or extra:
         raise PipelineError(step, f"{folder.name}: missing {missing[:10]}; unexpected {extra[:10]}")
+
+
+def _reused_chunk_folders(config: PipelineConfig, steps: StepRange) -> List[Tuple[Path, str]]:
+    """Per-chunk folders that a step of the range reads but a step before the range wrote."""
+    wx = (2, config.get_full_path("whisperx_output_folderName"), ".json")
+    corrected = (3, config.get_full_path("corrected_json_folderName"), ".json")
+    srts = (4, config.get_full_path("srt_folderName"), ".srt")
+    # step 7: the script is built from the SRTs and its gate reads the corrected JSON
+    reads = {3: [wx], 4: [corrected], 5: [srts], 7: [srts, corrected]}
+    folders: List[Tuple[Path, str]] = []
+    for step in range(steps.first, steps.last + 1):
+        for producer, folder, suffix in reads.get(step, []):
+            if producer < steps.first and (folder, suffix) not in folders:
+                folders.append((folder, suffix))
+    return folders
+
+
+def check_reused_outputs(config: PipelineConfig, steps: StepRange) -> None:
+    """Fail before cleanup if a reused per-chunk folder does not hold exactly one file per chunk item."""
+    folders = _reused_chunk_folders(config, steps)
+    if not folders:
+        return
+    expected = expected_chunk_stems(config, steps.first)
+    for folder, suffix in folders:
+        missing, extra = _coverage_gaps(folder, expected, suffix)
+        if missing or extra:
+            raise PipelineError(steps.first, f"{folder.name}/ from an earlier run does not match the chunk files: "
+                                             f"missing {missing[:10]}; unexpected {extra[:10]}. "
+                                             "Start from an earlier step to rebuild it.")
 
 
 _TAG_RE = re.compile(r"^\[([^\]]+)\]")
@@ -599,15 +637,46 @@ def run_whisperx_docker(
     cmd = build_whisperx_command(session_path, flac_files, config)
     log.info(f"Transcribing {len(flac_files)} chunk files with WhisperX ({config.whisperx_model}).")
     log.info(f"Executing Docker command: {redact_command(cmd)}")
+    name = container_name(session_path)
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, encoding="utf-8", errors="replace", bufsize=1)
     assert process.stdout is not None
-    for line in process.stdout:
-        docker_log.info(line.rstrip())
-    retcode = process.wait()
+    try:
+        for line in process.stdout:
+            docker_log.info(line.rstrip())
+        retcode = process.wait()
+    except BaseException:  # includes KeyboardInterrupt: never leave the container running on the GPU
+        log.error(f"Stopping WhisperX container {name} after an error.")
+        _stop_whisperx(process, name)
+        raise
+    finally:
+        process.stdout.close()
     if retcode != 0:
         raise RuntimeError(f"WhisperX Docker execution failed (exit code {retcode}).")
     log.info("WhisperX Docker command completed successfully.")
+
+
+def _stop_whisperx(process: "subprocess.Popen[str]", name: str) -> None:
+    """Terminate the docker client, stop its container, close the pipe and reap the client.
+    Errors here are logged only, so the original error is the one raised."""
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        subprocess.run(["docker", "stop", name], capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        log.warning(f"docker stop {name} failed: {e}")
+    try:
+        if process.stdout is not None:
+            process.stdout.close()  # a client blocked writing to a full pipe can then exit
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 # --- Main Pipeline Function ---
@@ -684,8 +753,8 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
     check_tracks_folder(config)  # before step 0, which renames and deletes inside it
 
     # Start of run, in this order (spec 4.7): tracks-folder check -> speaker config -> step 0 -> input
-    # checks -> delete-path guard -> done-marker removal -> run-in-progress marker -> cleanup. Nothing is
-    # deleted before every check has passed; step 0 only touches tracks/.
+    # checks -> reused-output coverage -> delete-path guard -> done-marker removal -> run-in-progress
+    # marker -> cleanup. Nothing is deleted before every check has passed; step 0 only touches tracks/.
     speakers = config.speakers
     if speakers is None and (steps.includes(1) or steps.includes(7)):
         # an input of step 0 and of the step-7 gate; a missing CW_SPEAKERS fails here, logged
@@ -694,6 +763,7 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
         _run_step(0, "Preparing tracks", lambda: prepare_tracks(
             config.base_path, speakers, config.input_audio_folderName, rename=config.auto_prepare_tracks))
     check_step_inputs(config, steps.first, steps.last)
+    check_reused_outputs(config, steps)
     if steps.first <= LAST_CLEANUP_STEP:
         _guard_deletable(config, _cleanup_paths(config, steps.first))
     final.mkdir(parents=True, exist_ok=True)

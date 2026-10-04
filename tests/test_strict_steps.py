@@ -63,3 +63,29 @@ def test_script_written_atomically(tmp_path, monkeypatch):
     srt_to_script(srt_file, out)
     assert out.read_text(encoding="utf-8") == "[GM] bonjour"
     assert calls and calls[-1][1] == "final_script.txt"
+
+
+# --- final review F6: speech without word timings is kept, not dropped ---
+
+def test_text_without_words_reaches_corrected_json_and_srt(tmp_path):
+    src, dst, srt = tmp_path / "wx", tmp_path / "json", tmp_path / "srt"
+    src.mkdir()
+    data = {"segments": [
+        {"start": 0.0, "end": 1.0, "text": "bonjour",
+         "words": [{"word": "bonjour", "start": 0.0, "end": 1.0, "score": 0.9}]},
+        {"start": 1.1, "end": 2.0, "text": " sans mots ici ", "words": []},
+        {"start": 2.1, "end": 2.6, "text": "aussi sans mots"},
+        {"start": 2.7, "end": 3.0, "text": "encore", "words": [{"word": "encore", "start": 2.7, "end": 3.0}]},
+    ]}
+    (src / "GM-01.json").write_text(json.dumps(data), encoding="utf-8")
+    correct_whisperx_outputs(src, dst, overwrite=True)
+    texts = [s["text"] for s in json.loads((dst / "GM-01.json").read_text(encoding="utf-8"))["segments"]]
+    joined = " | ".join(texts)
+    for phrase in ("bonjour", "sans mots ici", "aussi sans mots", "encore"):
+        assert phrase in joined
+    kept = [s for s in json.loads((dst / "GM-01.json").read_text(encoding="utf-8"))["segments"]
+            if s["text"] == "sans mots ici"]
+    assert kept and kept[0]["start"] == 1.1 and kept[0]["end"] == 2.0
+    convert_json_folder_to_srt(dst, srt)
+    srt_text = (srt / "GM-01.srt").read_text(encoding="utf-8")
+    assert "sans mots ici" in srt_text and "aussi sans mots" in srt_text
