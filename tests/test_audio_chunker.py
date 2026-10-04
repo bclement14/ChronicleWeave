@@ -350,3 +350,129 @@ def test_chunk_audio_no_tracks_raises(tmp_path):
     (tmp_path / "tracks").mkdir()
     with pytest.raises(FileNotFoundError):
         chunk_audio(tmp_path / "tracks", tmp_path / "c", tmp_path / "m.flac", tmp_path / "cp.txt")
+
+
+# --- final review F10: the merged file is decoded once; windows and silences are unchanged ---
+from unittest.mock import patch
+
+from pydub import silence
+
+from chronicleweave.modules.audio_chunker import detect_silence_windowed, iter_pcm_windows
+
+RATE = 16000
+# Digital silences: one across the 60 s window edge (>= 1 s on each side, merged into one range), one
+# across the 120 s edge with only 0.8 s before it (the previous detector misses that part; so must
+# the new one), and one running to the very end.
+SILENCES = [(10.0, 12.5), (58.5, 61.7), (100.0, 101.5), (119.2, 122.0), (130.0, 130.5), (148.9, 150.6)]
+DURATION = 150.50031  # not a whole number of ms: the last window is shorter and the stream ends a few samples later
+
+
+def _merged_like(path, seconds, silences, seed=0):
+    """A 16 kHz mono s16 FLAC like the step-1 merge: noise around digital silences."""
+    rng = np.random.default_rng(seed)
+    x = (rng.standard_normal(int(seconds * RATE)) * 3000).astype(np.int16)
+    for a, b in silences:
+        x[int(a * RATE):int(b * RATE)] = 0
+    AudioSegment(x.tobytes(), frame_rate=RATE, sample_width=2, channels=1).export(path, format="flac")
+
+
+def _pydub_windows(path, total_ms, window_ms=60000):
+    """The windows the previous detector loaded: one pydub (ffmpeg + ffprobe) decode per window."""
+    for start in range(0, total_ms, window_ms):
+        load = min(window_ms, total_ms - start)
+        yield start, AudioSegment.from_file(path, format="flac", start_second=start / 1000.0, duration=load / 1000.0)
+
+
+def _previous_detector(path, config, duration_s):
+    """The previous implementation: same per-window detection and the same range merging."""
+    ranges = []
+    for start, chunk in _pydub_windows(path, int(duration_s * 1000), config.incremental_chunk_size_ms):
+        for s, e in silence.detect_silence(chunk, min_silence_len=config.min_silence_duration_ms,
+                                           silence_thresh=config.silence_threshold_dbfs):
+            ranges.append(((start + s) / 1000.0, (start + e) / 1000.0))
+    ranges.sort()
+    merged = [list(ranges[0])]
+    for s, e in ranges[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [tuple(r) for r in merged]
+
+
+@pytest.fixture(scope="module")
+def merged_file(tmp_path_factory):
+    path = tmp_path_factory.mktemp("merged") / "merged_audio.flac"
+    _merged_like(path, DURATION, SILENCES)
+    return path
+
+
+def test_windows_equal_pydub_windows_byte_for_byte(merged_file):
+    total_ms = int(probe_duration_s(merged_file) * 1000)
+    new = list(iter_pcm_windows(merged_file, total_ms, 60000))
+    old = list(_pydub_windows(merged_file, total_ms))
+    assert [s for s, _ in new] == [s for s, _ in old] == [0, 60000, 120000]
+    for (_, a), (_, b) in zip(new, old):
+        assert (a.frame_rate, a.channels, a.sample_width) == (b.frame_rate, b.channels, b.sample_width)
+        assert len(a.raw_data) == len(b.raw_data) and a.raw_data == b.raw_data
+
+
+def test_detected_ranges_identical_to_previous_detector(merged_file):
+    duration = probe_duration_s(merged_file)
+    new = detect_silence_windowed(merged_file, DEFAULT_CHUNKING_CONFIG, duration)
+    assert new == _previous_detector(merged_file, DEFAULT_CHUNKING_CONFIG, duration)
+    assert any(s < 60.0 < e for s, e in new)  # merged across the 60 s edge
+    assert any(s == 120.0 for s, _ in new) and not any(s < 120.0 < e for s, e in new)  # same edge artifact
+
+
+def test_merged_file_decoded_by_one_ffmpeg_process(merged_file):
+    duration = probe_duration_s(merged_file)
+    real_popen = subprocess.Popen
+    cmds = []
+
+    def spy(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return real_popen(cmd, *a, **k)
+
+    with patch("subprocess.Popen", side_effect=spy), patch("pydub.silence.detect_silence", return_value=[]):
+        detect_silence_windowed(merged_file, DEFAULT_CHUNKING_CONFIG, duration)
+    assert cmds == [["ffmpeg", "-nostdin", "-v", "error", "-i", str(merged_file),
+                     "-f", "s16le", "-ac", "1", "-ar", "16000", "-"]]
+
+
+def test_truncated_merged_file_raises(tmp_path, merged_file):
+    data = merged_file.read_bytes()
+    truncated = tmp_path / "merged_audio.flac"
+    truncated.write_bytes(data[: len(data) // 2])
+    duration = probe_duration_s(merged_file)  # the header still announces the full length
+    with pytest.raises(RuntimeError, match="ended early") as err:
+        detect_silence_windowed(truncated, DEFAULT_CHUNKING_CONFIG, duration)
+    assert "Silence detection failed" not in str(err.value)  # not re-wrapped
+
+
+def test_corrupt_merged_file_raises(tmp_path):
+    bad = tmp_path / "merged_audio.flac"
+    bad.write_bytes(b"not audio at all")
+    with pytest.raises(RuntimeError, match="exit") as err:
+        detect_silence_windowed(bad, DEFAULT_CHUNKING_CONFIG, 120.0)
+    assert "Silence detection failed" not in str(err.value)
+
+
+@pytest.mark.parametrize("tty", [False, True])  # with a terminal, tqdm shows a bar and does not close the iterable
+def test_detection_error_stops_the_decoder(merged_file, tty):
+    import sys
+    duration = probe_duration_s(merged_file)
+    real_popen = subprocess.Popen
+    procs = []
+
+    def spy(cmd, *a, **k):
+        procs.append(real_popen(cmd, *a, **k))
+        return procs[-1]
+
+    with patch("subprocess.Popen", side_effect=spy), patch.object(sys.stdout, "isatty", return_value=tty), \
+            patch("pydub.silence.detect_silence", side_effect=ValueError("analysis broke")):
+        with pytest.raises(RuntimeError, match="analysis broke") as err:
+            detect_silence_windowed(merged_file, DEFAULT_CHUNKING_CONFIG, duration)
+    # checked while the traceback (and so the detector's frame) is still alive, as when a caller logs it
+    assert err.value.__traceback__ is not None
+    assert len(procs) == 1 and procs[0].returncode is not None  # ffmpeg reaped, not left blocked on its pipe

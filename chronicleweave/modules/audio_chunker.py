@@ -3,11 +3,12 @@
 import logging
 import numpy as np
 import sys
+import tempfile
+from contextlib import closing
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Iterator, List, Sequence, Tuple
 import subprocess
 from pydub import AudioSegment, silence
-from pydub.exceptions import CouldntDecodeError
 import os
 from tqdm import tqdm
 from dataclasses import dataclass, field
@@ -25,9 +26,8 @@ class ChunkingConfig:
     # Segment Duration Constraints (seconds)
     min_chunk_duration_s: int = field(default=9 * 60)
     max_chunk_duration_s: int = field(default=15 * 60)
-    # Incremental Processing (Low RAM mode)
-    # Chunk size for processing large files incrementally (milliseconds)
-    incremental_chunk_size_ms: int = 60000 # 1 minute chunks for low RAM processing
+    # Silence detection analyses the merged file in windows of this length (milliseconds)
+    incremental_chunk_size_ms: int = 60000 # 1 minute windows
 
     def __post_init__(self):
         # Validation
@@ -111,9 +111,79 @@ def merge_tracks(tracks: Sequence[Path], output: Path) -> None:
 
 # --- Silence Detection ---
 
+PCM_FRAME_RATE = 16000  # the merged file's format (build_merge_command): 16 kHz mono s16
+PCM_SAMPLE_WIDTH = 2
+_PCM_BYTES_PER_MS = PCM_FRAME_RATE * PCM_SAMPLE_WIDTH // 1000
+
+
+def build_pcm_decode_command(audio_file: Path) -> List[str]:
+    return ["ffmpeg", "-nostdin", "-v", "error", "-i", str(audio_file),
+            "-f", "s16le", "-ac", "1", "-ar", str(PCM_FRAME_RATE), "-"]
+
+
+def _read_exact(stream, size: int) -> bytes:
+    parts, remaining = [], size
+    while remaining > 0:
+        block = stream.read(remaining)
+        if not block:
+            break
+        parts.append(block)
+        remaining -= len(block)
+    return b"".join(parts)
+
+
+def _stderr_tail(errfile) -> str:
+    errfile.seek(0)
+    lines = errfile.read().decode("utf-8", errors="replace").strip().splitlines()
+    return "\n".join(lines[-5:])
+
+
+def iter_pcm_windows(audio_file: Path, total_length_ms: int, window_ms: int) -> Iterator[Tuple[int, AudioSegment]]:
+    """Decode `audio_file` ONCE with one ffmpeg process and yield (start_ms, window) for consecutive
+    windows of `window_ms` (the last one shorter) covering exactly `total_length_ms`. The windows are the
+    ones the previous detector loaded with one pydub decode per window (from_file(start_second, duration)).
+
+    Raises RuntimeError on a read error, a non-zero ffmpeg exit, or a stream shorter than announced."""
+    with tempfile.TemporaryFile() as errfile:
+        proc = subprocess.Popen(build_pcm_decode_command(audio_file), stdout=subprocess.PIPE, stderr=errfile)
+        assert proc.stdout is not None
+        try:
+            for start_ms in range(0, total_length_ms, window_ms):
+                load_ms = min(window_ms, total_length_ms - start_ms)
+                wanted = load_ms * _PCM_BYTES_PER_MS
+                try:
+                    data = _read_exact(proc.stdout, wanted)
+                except OSError as e:
+                    raise RuntimeError(f"Could not read the decoded audio of {audio_file} at {start_ms} ms: {e}") from e
+                if len(data) < wanted:
+                    proc.stdout.close()
+                    code = proc.wait()
+                    if code != 0:
+                        raise RuntimeError(f"ffmpeg failed decoding {audio_file} for silence detection "
+                                           f"(exit {code}): {_stderr_tail(errfile)}")
+                    raise RuntimeError(f"Decoding {audio_file} for silence detection ended early at "
+                                       f"{start_ms + len(data) // _PCM_BYTES_PER_MS} ms of {total_length_ms} ms: "
+                                       f"{_stderr_tail(errfile)}")
+                yield start_ms, AudioSegment(data=data, sample_width=PCM_SAMPLE_WIDTH,
+                                             frame_rate=PCM_FRAME_RATE, channels=1)
+            while proc.stdout.read(1 << 16):  # the few samples past the last whole millisecond
+                pass
+            proc.stdout.close()
+            code = proc.wait()
+            if code != 0:
+                raise RuntimeError(f"ffmpeg failed decoding {audio_file} for silence detection "
+                                   f"(exit {code}): {_stderr_tail(errfile)}")
+        finally:
+            if proc.poll() is None:  # stopped early (error or abandoned generator): do not leave ffmpeg behind
+                proc.kill()
+            proc.stdout.close()
+            proc.wait()
+
+
 def detect_silence_windowed(audio_file: Path, config: ChunkingConfig, duration_s: float) -> List[Tuple[float, float]]:
-    """Detect silence incrementally using partial loading (improved RAM usage)."""
-    log.info("Detecting silences (low RAM mode - partial loading)...")
+    """Detect silences window by window (60 s by default) on one streamed decode of the merged file.
+    Each window is analysed on its own, then overlapping or touching ranges are merged."""
+    log.info("Detecting silences (one decode, windowed analysis)...")
     try:
         total_length_ms = int(duration_s * 1000)
         log.info(f"Audio duration: {duration_s:.2f}s ({total_length_ms}ms)")
@@ -124,59 +194,30 @@ def detect_silence_windowed(audio_file: Path, config: ChunkingConfig, duration_s
 
         all_silent_ranges_s: List[Tuple[float, float]] = []
         chunk_size_ms = config.incremental_chunk_size_ms
-        # Overlap chunks slightly to catch silences spanning boundaries? (Adds complexity)
-        # overlap_ms = config.min_silence_duration_ms # Example overlap
-        overlap_ms = 0 # Keep it simple for now
-
-        log.info(f"Processing in {chunk_size_ms}ms chunks...")
+        n_windows = -(-total_length_ms // chunk_size_ms)
+        log.info(f"Processing in {chunk_size_ms}ms windows...")
         disable_tqdm = not sys.stdout.isatty() or log.getEffectiveLevel() <= logging.DEBUG
 
-        for i in tqdm(range(0, total_length_ms, chunk_size_ms), desc="Analyzing chunks for silence", disable=disable_tqdm):
-            chunk_start_ms = i
-            # Load only the current chunk (+ overlap?)
-            # Duration to load: chunk_size, but clamp at the end of the file
-            load_duration_ms = min(chunk_size_ms + overlap_ms, total_length_ms - chunk_start_ms)
-
-            if load_duration_ms <= 0: continue # Should not happen with range, but safety check
-
-            log.debug(f"Loading chunk: Offset={chunk_start_ms}ms, Duration={load_duration_ms}ms")
-            try:
-                # --- Load only the necessary chunk ---
-                chunk = AudioSegment.from_file(
-                    audio_file,
-                    format="flac",
-                    start_second=chunk_start_ms / 1000.0, # from_file uses seconds for start
-                    duration=load_duration_ms / 1000.0     # duration also in seconds
+        # closing(): if detection fails mid-way, ffmpeg is stopped now, not at garbage collection
+        with closing(iter_pcm_windows(audio_file, total_length_ms, chunk_size_ms)) as windows:
+            for chunk_start_ms, chunk in tqdm(windows, total=n_windows, desc="Analyzing chunks for silence",
+                                              disable=disable_tqdm):
+                log.debug(f"Detecting silence in window at {chunk_start_ms}ms ({len(chunk)}ms)...")
+                chunk_silences_ms = silence.detect_silence(
+                    chunk,
+                    min_silence_len=config.min_silence_duration_ms,
+                    silence_thresh=config.silence_threshold_dbfs
                 )
-            except Exception as load_err:
-                raise RuntimeError(
-                    f"Could not read {audio_file} at {chunk_start_ms} ms for silence detection: {load_err}"
-                ) from load_err
-
-            log.debug(f"Detecting silence in loaded chunk ({len(chunk)}ms)...")
-            chunk_silences_ms = silence.detect_silence(
-                chunk,
-                min_silence_len=config.min_silence_duration_ms,
-                silence_thresh=config.silence_threshold_dbfs
-            )
-
-            # Adjust timestamps relative to the whole file and convert to seconds
-            for start_in_chunk_ms, end_in_chunk_ms in chunk_silences_ms:
-                # Important: Add the offset of the CHUNK start time
-                global_start_s = (chunk_start_ms + start_in_chunk_ms) / 1000.0
-                global_end_s = (chunk_start_ms + end_in_chunk_ms) / 1000.0
-
-                # Avoid adding silences that might be artifacts of chunk boundaries if not using overlap
-                # Or if using overlap, adjust to avoid double counting (more complex)
-                # Simple approach: Ensure the silence is fully within the non-overlapped part?
-                # For now, we add all detected silences within the loaded chunk duration
-
-                all_silent_ranges_s.append((global_start_s, global_end_s))
+                # Timestamps relative to the whole file, in seconds. Windows do not overlap, so a silence
+                # crossing a window edge is found as two parts (each at least min_silence_duration_ms
+                # long) that the merge below joins.
+                for start_in_chunk_ms, end_in_chunk_ms in chunk_silences_ms:
+                    all_silent_ranges_s.append(((chunk_start_ms + start_in_chunk_ms) / 1000.0,
+                                                (chunk_start_ms + end_in_chunk_ms) / 1000.0))
 
         log.info(f"Detected {len(all_silent_ranges_s)} potential silent ranges (boundary accuracy may vary).")
-        # Optional: Add merging logic for adjacent/overlapping ranges detected across chunks.
-        # Sort and merge overlapping/adjacent intervals
         if not all_silent_ranges_s: return []
+        # Sort and merge overlapping/adjacent intervals
         all_silent_ranges_s.sort()
         merged_ranges = [list(all_silent_ranges_s[0])] # Start with the first range as a mutable list
         for next_start, next_end in all_silent_ranges_s[1:]:
@@ -191,12 +232,11 @@ def detect_silence_windowed(audio_file: Path, config: ChunkingConfig, duration_s
         log.info(f"Merged into {len(final_merged_ranges)} final silent ranges.")
         return final_merged_ranges
 
-    except CouldntDecodeError as e:
-        log.exception(f"Could not decode audio file {audio_file}: {e}")
-        raise IOError(f"Failed to decode audio file {audio_file}") from e
+    except RuntimeError:
+        raise  # already says what failed; do not re-wrap
     except Exception as e:
-        log.exception(f"Error during low RAM silence detection: {e}")
-        raise RuntimeError("Silence detection failed") from e
+        log.exception(f"Error during silence detection: {e}")
+        raise RuntimeError(f"Silence detection failed: {e}") from e
 
 # --- Cut Point Logic ---
 
