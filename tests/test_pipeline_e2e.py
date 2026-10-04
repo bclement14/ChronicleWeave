@@ -212,3 +212,16 @@ def test_cleanup_oserror_becomes_logged_pipeline_error(synthetic_session):
             _run(synthetic_session)
     assert "disk says no" in (synthetic_session / "pipeline.log").read_text(encoding="utf-8")
     assert (synthetic_session / "final_outputs" / RUNNING_MARKER_NAME).exists()
+
+
+@pytest.mark.parametrize("folder", ["../other/tracks", "."])
+def test_tracks_folder_outside_session_refused_before_step0(synthetic_session, folder):
+    other = synthetic_session.parent / "other" / "tracks"
+    other.mkdir(parents=True)
+    music = other / "3-Spoticord_Music_4270.flac"
+    music.write_bytes(b"music")
+    with pytest.raises(PipelineError, match="tracks folder"):
+        _run(synthetic_session, input_audio_folderName=folder)
+    assert music.exists()
+    assert not list(synthetic_session.glob("*.flac"))  # nothing extracted into the session root
+    assert not (synthetic_session / "tracks").exists()

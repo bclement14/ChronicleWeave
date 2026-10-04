@@ -230,3 +230,22 @@ def test_validate_only_keeps_extract_leftover(tmp_path, cfg):
     (tracks / "GM.flac").write_bytes(b"gm")
     assert prepare_tracks(tmp_path, cfg, rename=False).tags == ["GM"]
     assert leftover.exists()
+
+
+# --- Tags must be plain file names (final review F1) ---
+
+@pytest.mark.parametrize("value", ["a:../GM", "a:x/GM", "a:x\\GM", "a:.hidden", "a:..", "a:G..M", "a:GM/"])
+def test_parse_rejects_tags_that_are_not_plain_file_names(value):
+    with pytest.raises(TrackPreparationError, match="Tag"):
+        parse_speaker_config(value, None)
+
+
+def test_tracks_folder_outside_session_refused(tmp_path, cfg):
+    session, other = tmp_path / "session1", tmp_path / "session2"
+    session.mkdir()
+    (other / "tracks").mkdir(parents=True)
+    music = other / "tracks" / "3-Spoticord_Music_4270.flac"
+    music.write_bytes(b"music")
+    with pytest.raises(TrackPreparationError, match="inside"):
+        prepare_tracks(session, cfg, "../session2/tracks")
+    assert music.exists()

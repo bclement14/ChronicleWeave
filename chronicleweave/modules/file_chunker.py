@@ -7,6 +7,21 @@ from typing import Union, List
 
 log = logging.getLogger(__name__)
 
+
+def validate_filename_template(template: str) -> None:
+    """A chunk file name template must be a plain file name (no folder part, no '..') taking one number."""
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(f"Chunk file name template {template!r} is empty.")
+    if "/" in template or "\\" in template or ".." in template:
+        raise ValueError(f"Chunk file name template {template!r} must be a plain file name (no '/', '\\' or '..').")
+    try:
+        sample = template.format(0)
+    except (IndexError, KeyError, ValueError) as e:
+        raise ValueError(f"Chunk file name template {template!r} must take one number, e.g. 'chunk_{{:02d}}.txt': {e}") from e
+    if sample.strip() in ("", ".", "..") or "/" in sample or "\\" in sample:
+        raise ValueError(f"Chunk file name template {template!r} does not give a plain file name ({sample!r}).")
+
+
 def chunk_text_file_by_lines(
     input_file: Union[str, Path],
     output_dir: Union[str, Path],
@@ -31,7 +46,9 @@ def chunk_text_file_by_lines(
     Raises:
         FileNotFoundError: If the input file does not exist.
         IOError: If the output directory cannot be created or files cannot be written.
+        ValueError: If the template is not a plain file name, or a chunk file would land outside output_dir.
     """
+    validate_filename_template(output_filename_template)
     input_path = Path(input_file)
     output_path = Path(output_dir)
 
@@ -46,6 +63,7 @@ def chunk_text_file_by_lines(
         raise IOError(f"Could not create output directory {output_path}") from e
 
     created_chunks = []
+    output_root = output_path.resolve()
     try:
         # Read the entire file first
         with open(input_path, 'r', encoding='utf-8') as f:
@@ -67,6 +85,8 @@ def chunk_text_file_by_lines(
                 break  # End of file
 
             chunk_file_path = output_path / output_filename_template.format(chunk_number)
+            if chunk_file_path.resolve().parent != output_root:  # e.g. a symlink pointing elsewhere
+                raise ValueError(f"Chunk file {chunk_file_path} would be written outside {output_path}")
             with open(chunk_file_path, 'w', encoding='utf-8') as chunk_f:
                 chunk_f.writelines(chunk_lines)
             
@@ -79,6 +99,8 @@ def chunk_text_file_by_lines(
 
     except IOError as e:
         log.exception(f"An I/O error occurred during chunking of {input_path}")
+        raise
+    except ValueError:
         raise
     except Exception as e:
         log.exception(f"An unexpected error occurred during chunking of {input_path}")

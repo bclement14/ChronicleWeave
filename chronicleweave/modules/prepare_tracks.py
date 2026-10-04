@@ -53,6 +53,11 @@ def parse_speaker_config(speakers_value: Optional[str], ignore_value: Optional[s
         username, tag = (part.strip() for part in entry.split(":", 1))
         if not username or not tag:
             raise TrackPreparationError(f"{SPEAKERS_VAR} entry {entry!r} has an empty username or Tag.")
+        if "/" in tag or "\\" in tag or ".." in tag or tag.startswith("."):
+            raise TrackPreparationError(
+                f"{SPEAKERS_VAR} entry {entry!r}: the Tag {tag!r} must be a plain file name "
+                "(no '/', '\\', '..' and no leading '.')."
+            )
         key = username.lower()
         if key in speakers:
             raise TrackPreparationError(f"{SPEAKERS_VAR} lists username {username!r} twice.")
@@ -179,6 +184,11 @@ def prepare_tracks(
 ) -> PrepareResult:
     session_path = Path(session_path)
     tracks = session_path / tracks_folder_name
+    session_resolved, tracks_resolved = session_path.resolve(), tracks.resolve()
+    if session_resolved not in tracks_resolved.parents or (
+        str(tracks_resolved).casefold() == str(session_resolved).casefold()
+    ):
+        raise TrackPreparationError(f"The tracks folder {tracks} must be a folder inside the session folder {session_path}.")
     result = PrepareResult()
     leftover = tracks / _EXTRACT_TMP
     if rename and (leftover.exists() or leftover.is_symlink()):

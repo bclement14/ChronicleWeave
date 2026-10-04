@@ -11,6 +11,7 @@ from chronicleweave.pipeline import (
     PipelineError,
     StepRange,
     check_coverage,
+    check_tracks_folder,
     check_final_script,
     check_step_inputs,
     cleanup_outputs,
@@ -217,3 +218,67 @@ def test_final_gate_missing_speaker_with_speech(tmp_path):
 def test_final_gate_silent_speaker_allowed(tmp_path):
     cfg = _final(tmp_path, "[GM] salut", {"GM-01": SEG, "Titar-01": []})
     check_final_script(cfg, ["GM-01", "Titar-01"], SPK)
+
+
+# --- final review F1: the chunk template is a plain file name, checked when the config is built ---
+
+@pytest.mark.parametrize("template", ["../../tracks/GM.flac", "sub/x_{:02d}.txt", "..\\x_{:02d}.txt",
+                                      "x..{:02d}.txt", ""])
+def test_chunk_template_rejected_at_config_time(tmp_path, template):
+    with pytest.raises(ValueError, match="template"):
+        PipelineConfig(base_path=tmp_path, script_chunk_filename_template=template)
+
+
+def test_chunk_template_default_accepted(tmp_path):
+    assert PipelineConfig(base_path=tmp_path).script_chunk_filename_template == "script_chunk_{:02d}.txt"
+
+
+@pytest.mark.parametrize("folder", ["../other/tracks", ".", "..", "/tmp"])
+def test_tracks_folder_must_be_inside_session(tmp_path, folder):
+    session = tmp_path / "s"
+    session.mkdir()
+    with pytest.raises(PipelineError, match="tracks folder"):
+        check_tracks_folder(PipelineConfig(base_path=session, input_audio_folderName=folder))
+
+
+def test_tracks_folder_nested_inside_session_ok(tmp_path):
+    check_tracks_folder(PipelineConfig(base_path=tmp_path, input_audio_folderName="audio/tracks"))
+
+
+# --- final review F2: never delete a folder that holds a Craig archive anywhere below it ---
+
+@pytest.mark.parametrize("archive", ["saved_archives/craig-X.flac.zip", "saved_archives/deep/Craig-Y.FLAC.ZIP"])
+def test_cleanup_guard_refuses_folder_containing_an_archive(tmp_path, archive):
+    _layout(tmp_path)
+    _put(tmp_path, archive)
+    cfg = PipelineConfig(base_path=tmp_path, script_chunks_in_final_folder=False,
+                         script_chunks_folderName="saved_archives")
+    with pytest.raises(PipelineError, match="archive"):
+        cleanup_outputs(cfg, 1)
+    assert (tmp_path / archive).exists()
+    assert (tmp_path / "chunked_tracks").exists()  # nothing deleted before the guard
+
+
+# --- final review F3: paths that differ only by letter case are the same folder on NTFS ---
+
+@pytest.mark.parametrize("folder,match", [
+    ("Tracks", "tracks"), ("TRACKS/sub", "tracks"), ("FINAL_OUTPUTS", "final outputs"),
+])
+def test_cleanup_guard_ignores_letter_case(tmp_path, folder, match):
+    _layout(tmp_path)
+    _put(tmp_path, f"{folder}/keep.flac")
+    cfg = PipelineConfig(base_path=tmp_path, script_chunks_in_final_folder=False, script_chunks_folderName=folder)
+    with pytest.raises(PipelineError, match=match):
+        cleanup_outputs(cfg, 1)
+    assert (tmp_path / folder / "keep.flac").exists()
+    assert (tmp_path / "chunked_tracks").exists()
+
+
+def test_cleanup_guard_case_variant_containing_tracks(tmp_path):
+    _layout(tmp_path)
+    _put(tmp_path, "audio/tracks/GM.flac")
+    cfg = PipelineConfig(base_path=tmp_path, input_audio_folderName="audio/tracks",
+                         script_chunks_in_final_folder=False, script_chunks_folderName="AUDIO")
+    with pytest.raises(PipelineError, match="tracks"):
+        cleanup_outputs(cfg, 8)
+    assert (tmp_path / "audio" / "tracks" / "GM.flac").exists()

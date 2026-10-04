@@ -77,3 +77,29 @@ def test_chunk_filename_template_applied(tmp_path: Path):
         src, out, chunk_size=2, output_filename_template="part_{:03d}.txt"
     )
     assert {c.name for c in chunks} == {"part_000.txt", "part_001.txt", "part_002.txt"}
+
+
+# --- path containment (final review F1) ---
+
+@pytest.mark.parametrize("template", ["../../tracks/GM_{:02d}.flac", "sub/part_{:02d}.txt",
+                                      "..\\part_{:02d}.txt", "part..{:02d}.txt", "", "  "])
+def test_chunk_template_must_be_plain_file_name(tmp_path: Path, template):
+    src = tmp_path / "in.txt"
+    src.write_text("x\n" * 3, encoding="utf-8")
+    with pytest.raises(ValueError, match="template"):
+        chunk_text_file_by_lines(src, tmp_path / "s" / "out", chunk_size=1, output_filename_template=template)
+    assert not any(p.suffix == ".flac" for p in tmp_path.rglob("*"))
+
+
+def test_chunk_file_symlinked_outside_is_refused(tmp_path: Path):
+    src = tmp_path / "in.txt"
+    src.write_text("x\n" * 3, encoding="utf-8")
+    victim = tmp_path / "tracks" / "GM.flac"
+    victim.parent.mkdir()
+    victim.write_bytes(b"audio")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "part_01.txt").symlink_to(victim)
+    with pytest.raises(ValueError, match="outside"):
+        chunk_text_file_by_lines(src, out, chunk_size=1, output_filename_template="part_{:02d}.txt")
+    assert victim.read_bytes() == b"audio"

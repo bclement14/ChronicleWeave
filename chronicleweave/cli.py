@@ -78,10 +78,13 @@ def batch_main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="chronicleweave-batch", description="Process every session folder under ROOT.")
     parser.add_argument("root", type=Path, help="Folder containing session<N> folders.")
     parser.add_argument("--only", help="Session numbers to consider, e.g. '13,15-19'.")
-    parser.add_argument("--force", action="store_true", help="Re-process sessions that are already done.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-process sessions that are already done; needs --only.")
     add_pipeline_arguments(parser)
     args = parser.parse_args(argv)
     try:
+        if args.force and args.only is None:
+            raise ValueError("--force needs --only: name the sessions to re-process, e.g. --force --only 14")
         load_env(args.env_file)
         kwargs = pipeline_kwargs_from_args(args)
         only = parse_only(args.only)

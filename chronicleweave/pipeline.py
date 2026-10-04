@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field, replace, fields
-from typing import Optional, Union, List, Sequence, Dict, Any, Mapping, NamedTuple, Iterator, Set
+from typing import Optional, Union, List, Sequence, Dict, Any, Mapping, NamedTuple, Iterator, Set, Tuple
 
 # --- Imports ---
 from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING_CONFIG
@@ -22,7 +22,7 @@ from .modules.merge_srt_by_chunk import merge_srt_by_chunk
 from .modules.merge_speaker_entries import merge_speaker_entries
 from .modules.convert_srt_to_script import srt_to_script
 from .modules.llm_processor import process_with_llm, LLMConfig, DEFAULT_LLM_CONFIG
-from .modules.file_chunker import chunk_text_file_by_lines
+from .modules.file_chunker import chunk_text_file_by_lines, validate_filename_template
 
 # --- Configuration Dataclasses ---
 
@@ -133,6 +133,9 @@ class PipelineConfig:
     chunking_config: ChunkingConfig = field(default_factory=lambda: DEFAULT_CHUNKING_CONFIG)
     corrector_config: WhisperXCorrectorConfig = field(default_factory=lambda: DEFAULT_CORRECTOR_CONFIG)
     llm_config: LLMConfig = field(default_factory=lambda: DEFAULT_LLM_CONFIG)
+
+    def __post_init__(self) -> None:
+        validate_filename_template(self.script_chunk_filename_template)  # step 8 writes only inside its folder
 
     def get_full_path(self, folder_or_file_attr: str) -> Path:
         """Helper to get the full path relative to the base_path."""
@@ -296,21 +299,64 @@ def step_output_paths(config: PipelineConfig, step: int) -> List[Path]:
     return table.get(step, [])
 
 
+def _folded(path: Path) -> Tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts)
+
+
+def _same_or_inside(path: Path, folder: Path) -> bool:
+    """`path` is `folder` or lies below it, ignoring letter case: session folders live on
+    case-insensitive NTFS, where `Tracks` and `tracks` are the same folder."""
+    p, f = _folded(path), _folded(folder)
+    return p[:len(f)] == f
+
+
+def _strictly_inside(path: Path, folder: Path) -> bool:
+    """`path` lies below `folder` (exact match) and is not `folder` itself in any letter case."""
+    return folder in path.parents and _folded(path) != _folded(folder)
+
+
+def _is_archive_name(name: str) -> bool:
+    folded = name.casefold()
+    return folded.startswith("craig-") and folded.endswith(".zip")
+
+
+def _archive_below(folder: Path) -> Optional[Path]:
+    """The first Craig archive found anywhere below `folder` (symlinks are not followed, like rmtree)."""
+    if not folder.is_dir() or folder.is_symlink():
+        return None
+    for dirpath, _dirnames, filenames in os.walk(folder, followlinks=False):
+        for name in filenames:
+            if _is_archive_name(name):
+                return Path(dirpath) / name
+    return None
+
+
+def check_tracks_folder(config: PipelineConfig) -> None:
+    """The input tracks folder must be a folder inside the session (step 0 renames and deletes there)."""
+    session = config.base_path.resolve()
+    tracks = config.get_full_path("input_audio_folderName").resolve()
+    if not _strictly_inside(tracks, session):
+        raise PipelineError(0, f"The tracks folder {tracks} must be a folder inside the session folder {session}")
+
+
 def _guard_deletable(config: PipelineConfig, paths: Sequence[Path]) -> None:
+    """Refuse the whole cleanup, before anything is deleted, if any path is unsafe to delete."""
     session = config.base_path.resolve()
     tracks = config.get_full_path("input_audio_folderName").resolve()
     final = config.get_full_path("final_folderName").resolve()
     for path in paths:
         resolved = path.resolve()
-        if resolved == session or session not in resolved.parents:
+        if not _strictly_inside(resolved, session):
             raise PipelineError(0, f"Refusing to delete {path}: outside the session folder {session}")
-        if resolved == tracks or tracks in resolved.parents or resolved in tracks.parents:
+        if _same_or_inside(resolved, tracks) or _same_or_inside(tracks, resolved):
             raise PipelineError(0, f"Refusing to delete {path}: overlaps the input tracks folder {tracks}")
-        if resolved == final or resolved in final.parents:
+        if _same_or_inside(final, resolved):
             raise PipelineError(0, f"Refusing to delete {path}: it is or contains the final outputs folder {final}")
-        name = resolved.name.lower()
-        if name.startswith("craig-") and name.endswith(".zip"):
+        if _is_archive_name(resolved.name):
             raise PipelineError(0, f"Refusing to delete Craig archive {path}")
+        archive = _archive_below(resolved)
+        if archive is not None:
+            raise PipelineError(0, f"Refusing to delete {path}: it contains the Craig archive {archive}")
 
 
 def _cleanup_paths(config: PipelineConfig, first_step: int) -> List[Path]:
@@ -635,10 +681,11 @@ def _run_steps(config: PipelineConfig, steps: StepRange) -> None:
     running_marker = final / RUNNING_MARKER_NAME
     rebuilds_script = steps.first <= 7
     log.info(f"Session {config.base_path} — steps {steps.first}-{steps.last}, model {config.whisperx_model}")
+    check_tracks_folder(config)  # before step 0, which renames and deletes inside it
 
-    # Start of run, in this order (spec 4.7): speaker config -> step 0 -> input checks -> delete-path
-    # guard -> done-marker removal -> run-in-progress marker -> cleanup. Nothing is deleted before
-    # every check has passed; step 0 only touches tracks/.
+    # Start of run, in this order (spec 4.7): tracks-folder check -> speaker config -> step 0 -> input
+    # checks -> delete-path guard -> done-marker removal -> run-in-progress marker -> cleanup. Nothing is
+    # deleted before every check has passed; step 0 only touches tracks/.
     speakers = config.speakers
     if speakers is None and (steps.includes(1) or steps.includes(7)):
         # an input of step 0 and of the step-7 gate; a missing CW_SPEAKERS fails here, logged

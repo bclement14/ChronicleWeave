@@ -49,3 +49,25 @@ def test_batch_main_exit_codes(tmp_path):
         assert cli.batch_main([str(tmp_path)]) == 0
     with patch("chronicleweave.cli.load_env"), patch("chronicleweave.cli.run_batch", return_value=bad):
         assert cli.batch_main([str(tmp_path), "--only", "1"]) == 1
+
+
+def _batch_root(tmp_path):
+    session = tmp_path / "session10"
+    session.mkdir()
+    (session / "craig-X.flac.zip").write_bytes(b"z")
+    return tmp_path
+
+
+def test_batch_force_requires_only(tmp_path, capsys):
+    root = _batch_root(tmp_path)
+    with patch("chronicleweave.cli.load_env"), patch("chronicleweave.cli.run_batch") as rb:
+        assert cli.batch_main([str(root), "--force", "--steps", "3-7"]) == 1
+    rb.assert_not_called()
+    assert "--only" in capsys.readouterr().err
+
+
+def test_batch_force_with_only_runs(tmp_path):
+    root = _batch_root(tmp_path)
+    with patch("chronicleweave.cli.load_env"), patch("chronicleweave.cli.run_batch", return_value=[]) as rb:
+        assert cli.batch_main([str(root), "--force", "--only", "10", "--steps", "3-7"]) == 0
+    assert rb.call_args.kwargs["force"] is True and rb.call_args.kwargs["only"] == {10}
