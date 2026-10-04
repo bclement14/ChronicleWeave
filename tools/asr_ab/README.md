@@ -5,3 +5,5 @@
 3. Score: `python -m tools.asr_ab.ab score --answers answers.json --mapping ab_page/mapping.json --a-name large-v3 --a-script <A>/final_outputs/final_script.txt --b-name dec16 --b-script <B>/final_outputs/final_script.txt --candidate dec16`
 
 Names must match those used at build. Rule (spec 4.9): ≥ 20 non-tied answers, candidate wins ≥ 2/3 of them, and no more repetition loops than the baseline.
+
+Windows: per speaker chunk, speech separated by pauses of at least 1 s in both transcripts. A span over 25 s is split only at a pause that no segment of either model crosses (the longest such pause), so the same speech segmented differently compares equal. A span with no such pause stays whole up to 60 s; a longer one is not judged (the build reports how many). Repetition loops: the same phrase of 3 to 30 words repeated 3+ times in a row, after removing the `[Tag]` speaker prefixes.

@@ -12,7 +12,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 Segment = Tuple[float, float, str]
 
@@ -30,20 +30,52 @@ def load_chunk_segments(json_dir: Path) -> Dict[str, List[Segment]]:
     return out
 
 
-def build_windows(a: List[Segment], b: List[Segment], max_len: float = 25.0, gap: float = 1.0) -> List[Tuple[float, float]]:
-    spans = sorted((s, e) for s, e, _ in a + b)
+def _safe_gaps(segs: List[Tuple[float, float]], lo: float, hi: float) -> List[Tuple[float, float]]:
+    """Gaps strictly inside (lo, hi) that no segment of either model crosses."""
+    gaps: List[Tuple[float, float]] = []
+    reach = None
+    for s, e in sorted(segs):
+        if reach is not None and s >= reach and lo < reach and s < hi:
+            gaps.append((reach, s))
+        reach = e if reach is None else max(reach, e)
+    return gaps
+
+
+def _split_span(span: Tuple[float, float], segs: List[Tuple[float, float]], max_len: float, hard_max: float,
+                windows: List[Tuple[float, float]], left_out: List[Tuple[float, float]]) -> None:
+    lo, hi = span
+    if hi - lo <= max_len:
+        windows.append(span)
+        return
+    inner = [(s, e) for s, e in segs if lo <= s and e <= hi]
+    gaps = _safe_gaps(inner, lo, hi)
+    if not gaps:  # cutting would split a segment and fake a difference: keep it whole, or leave it out
+        (windows if hi - lo <= hard_max else left_out).append(span)
+        return
+    mid = (lo + hi) / 2
+    g0, g1 = max(gaps, key=lambda g: (g[1] - g[0], -abs((g[0] + g[1]) / 2 - mid)))  # largest, then most central
+    _split_span((lo, g0), inner, max_len, hard_max, windows, left_out)
+    _split_span((g1, hi), inner, max_len, hard_max, windows, left_out)
+
+
+def build_windows(a: List[Segment], b: List[Segment], max_len: float = 25.0, gap: float = 1.0,
+                  hard_max: float = 60.0, left_out: Optional[List[Tuple[float, float]]] = None,
+                  ) -> List[Tuple[float, float]]:
+    """Windows of speech bounded by pauses in both transcripts. A span longer than `max_len` is split
+    only at a gap that no segment of either model crosses (the largest one), so every segment lies in
+    exactly one window and different segmentation of the same speech gives the same text. A span with
+    no such gap is kept whole up to `hard_max` seconds; a longer one is not judged (added to `left_out`)."""
+    segs = sorted((s, e) for s, e, _ in a + b)
     merged: List[List[float]] = []
-    for s, e in spans:
+    for s, e in segs:
         if merged and s - merged[-1][1] < gap:
             merged[-1][1] = max(merged[-1][1], e)
         else:
             merged.append([s, e])
     windows: List[Tuple[float, float]] = []
+    dropped = left_out if left_out is not None else []
     for s, e in merged:
-        while e - s > max_len:
-            windows.append((s, s + max_len))
-            s += max_len
-        windows.append((s, e))
+        _split_span((s, e), segs, max_len, hard_max, windows, dropped)
     return windows
 
 
@@ -56,12 +88,17 @@ def normalise(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s'-]", " ", text.lower()).split())
 
 
-def select_items(a_dir: Path, b_dir: Path, n: int = 30, seed: int = 7) -> List[dict]:
+def select_items(a_dir: Path, b_dir: Path, n: int = 30, seed: int = 7,
+                 left_out: Optional[List[Tuple[str, float, float]]] = None) -> List[dict]:
     a_all, b_all = load_chunk_segments(a_dir), load_chunk_segments(b_dir)
     by_speaker: Dict[str, List[dict]] = defaultdict(list)
     for stem in sorted(set(a_all) | set(b_all)):
         a, b = a_all.get(stem, []), b_all.get(stem, [])
-        for start, end in build_windows(a, b):
+        too_long: List[Tuple[float, float]] = []
+        windows = build_windows(a, b, left_out=too_long)
+        if left_out is not None:
+            left_out.extend((stem, s, e) for s, e in too_long)
+        for start, end in windows:
             at, bt = window_text(a, (start, end)), window_text(b, (start, end))
             if normalise(at) != normalise(bt):
                 by_speaker[stem.rsplit("-", 1)[0]].append(
@@ -80,12 +117,17 @@ def select_items(a_dir: Path, b_dir: Path, n: int = 30, seed: int = 7) -> List[d
     return picked
 
 
-def repetition_loops(text: str, min_words: int = 3, min_repeats: int = 3) -> int:
-    words = normalise(text).split()
+_TAG_PREFIX = re.compile(r"^\s*\[[^\]]*\]", re.MULTILINE)
+
+
+def repetition_loops(text: str, min_words: int = 3, min_repeats: int = 3, max_words: int = 30) -> int:
+    """Count runs of the same phrase (min_words..max_words words) repeated min_repeats+ times in a row.
+    The `[Tag]` speaker prefixes of the script are removed first, so they cannot form loops themselves."""
+    words = normalise(_TAG_PREFIX.sub(" ", text)).split()
     loops, i = 0, 0
     while i < len(words):
         found = False
-        for size in range(min_words, 13):
+        for size in range(min_words, max_words + 1):
             phrase = words[i:i + size]
             if len(phrase) < size:
                 break
@@ -181,9 +223,12 @@ def main(argv=None) -> int:
     s.add_argument("--candidate", required=True, help="Model name that would replace the baseline.")
     args = parser.parse_args(argv)
     if args.cmd == "build":
-        items = select_items(args.a, args.b, n=args.n)
+        left_out: List[Tuple[str, float, float]] = []
+        items = select_items(args.a, args.b, n=args.n, left_out=left_out)
         page, mapping = build_page(items, args.a_name, args.b_name, args.chunks, args.out)
         print(f"{len(items)} items. Open {page} in a browser; mapping kept in {mapping}.")
+        if left_out:
+            print(f"{len(left_out)} span(s) longer than 60 s with no common pause were not judged.")
         return 0
     cand = args.candidate
     mapping_models = sorted({m for v in json.loads(args.mapping.read_text(encoding="utf-8")).values() for m in v.values()})

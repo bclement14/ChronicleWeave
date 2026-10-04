@@ -147,3 +147,62 @@ def test_score_reports_ignored_answers(tmp_path):
     (tmp_path / "s.txt").write_text("ok")
     res = score(tmp_path / "a.json", tmp_path / "m.json", {"a": tmp_path / "s.txt", "b": tmp_path / "s.txt"})
     assert res["ignored"] == 2 and res["non_tied"] == 1
+
+
+# --- final review F15: no hard cut inside a segment; loop scan ignores speaker tags ---
+
+def _w(lo, hi):
+    return " ".join(f"mot{i}" for i in range(lo, hi))
+
+
+def test_same_speech_segmented_differently_gives_no_difference(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    _json(a / "GM-01.json", [(0, 10, _w(0, 10)), (10, 20, _w(10, 20)), (20, 30, _w(20, 30))])
+    _json(b / "GM-01.json", [(0, 15, _w(0, 15)), (15, 30, _w(15, 30))])
+    assert select_items(a, b) == []
+
+
+def test_long_span_is_split_only_where_no_segment_crosses():
+    a = [(0.0, 10.0, "x"), (10.2, 20.0, "y"), (20.2, 30.0, "z")]
+    b = [(0.0, 20.0, "xy"), (20.2, 30.0, "z")]  # crosses 10.1, not 20.1
+    assert build_windows(a, b) == [(0.0, 20.0), (20.2, 30.0)]
+
+
+def test_largest_safe_gap_is_chosen():
+    a = [(0.0, 9.0, "x"), (9.2, 18.0, "y"), (18.9, 30.0, "z")]
+    assert build_windows(a, a) == [(0.0, 18.0), (18.9, 30.0)]
+
+
+def test_span_without_safe_boundary_is_kept_whole_up_to_60s():
+    a = [(0.0, 10.0, "a"), (10.0, 20.0, "b"), (20.0, 30.0, "c"), (30.0, 40.0, "d")]
+    b = [(0.0, 15.0, "ab"), (15.0, 25.0, "bc"), (25.0, 35.0, "cd"), (35.0, 40.0, "d")]
+    assert build_windows(a, b) == [(0.0, 40.0)]
+
+
+def test_span_over_60s_without_safe_boundary_is_left_out():
+    a = [(0.0, 35.0, "a"), (35.0, 70.0, "b")]
+    b = [(0.0, 70.0, "ab")]
+    left_out = []
+    assert build_windows(a, b, left_out=left_out) == [] and left_out == [(0.0, 70.0)]
+
+
+def test_every_segment_falls_in_exactly_one_window():
+    a = [(i * 1.0, i * 1.0 + 0.9, f"m{i}") for i in range(60)]
+    b = [(i * 3.0, i * 3.0 + 2.9, f"n{i}") for i in range(20)]
+    windows = build_windows(a, b)
+    for s, e, _ in a + b:
+        assert sum(lo <= s and e <= hi for lo, hi in windows) == 1
+
+
+def test_repetition_loop_of_14_word_phrase():
+    phrase = " ".join(f"mot{i}" for i in range(14))
+    assert repetition_loops(" ".join([phrase] * 3)) == 1
+
+
+def test_repeated_speaker_tags_alone_are_not_a_loop():
+    assert repetition_loops("[GM] bon alors\n\n[GM] bon alors\n\n[GM] bon alors\n") == 0
+
+
+def test_loop_across_tagged_lines_still_counts():
+    assert repetition_loops("[GM] sous-titrage ST 501\n[GM] sous-titrage ST 501\n[GM] sous-titrage ST 501\n") == 1
