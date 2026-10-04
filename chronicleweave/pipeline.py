@@ -724,7 +724,8 @@ def run_pipeline(
     }
     config = _build_pipeline_config(config_obj, base_path, explicit_kwargs, llm_config_overrides, kwargs)
     steps = parse_steps(config.steps_to_run)
-    config.base_path.mkdir(parents=True, exist_ok=True)
+    if not config.base_path.is_dir():  # never create a mistyped session folder
+        raise PipelineError(0, f"Session folder not found: {config.base_path}")
     level = getattr(logging, str(config.log_level).upper(), logging.INFO)
     with session_log_file(config.base_path, level):
         try:

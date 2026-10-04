@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
-from chronicleweave.batch import format_summary, parse_only, run_batch
+from chronicleweave.batch import check_docker_image, format_summary, parse_only, run_batch, select_sessions
 from chronicleweave.envfile import load_env
-from chronicleweave.pipeline import parse_steps, run_pipeline
+from chronicleweave.modules.prepare_tracks import TrackPreparationError, speaker_config_from_env
+from chronicleweave.pipeline import PipelineConfig, parse_steps, run_pipeline
 
 
 def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
@@ -58,13 +59,25 @@ def pipeline_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     return kwargs
 
 
+def env_summary(env_path: Optional[Path]) -> str:
+    """One line: which .env was loaded and the speaker Tags it defines (Tags only, no usernames)."""
+    source = f"Environment: loaded {env_path}" if env_path else "Environment: no .env found (shell variables only)"
+    try:
+        tags = "speaker Tags: " + ", ".join(speaker_config_from_env().speakers.values())
+    except TrackPreparationError as e:
+        tags = f"speaker Tags: none ({e})"
+    return f"{source}; {tags}"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="chronicleweave", description="Process one session folder.")
     parser.add_argument("--base-path", "-b", default=".", help="Session folder (default: current directory).")
     add_pipeline_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        load_env(args.env_file)
+        if not Path(args.base_path).is_dir():
+            raise ValueError(f"Session folder not found or not a folder: {args.base_path}")
+        print(env_summary(load_env(args.env_file)), flush=True)
         kwargs = pipeline_kwargs_from_args(args)
         run_pipeline(base_path=args.base_path, **kwargs)
     except Exception as e:
@@ -85,12 +98,30 @@ def batch_main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.force and args.only is None:
             raise ValueError("--force needs --only: name the sessions to re-process, e.g. --force --only 14")
-        load_env(args.env_file)
+        if not args.root.is_dir():
+            raise ValueError(f"Sessions root not found or not a folder: {args.root}")
+        print(env_summary(load_env(args.env_file)), flush=True)
         kwargs = pipeline_kwargs_from_args(args)
         only = parse_only(args.only)
     except Exception as e:
         print(f"❌ {e}", file=sys.stderr)
         return 1
+    selected = select_sessions(args.root, only)
+    missing = sorted(only - {s.number for s in selected}) if only else []
+    if missing:
+        print(f"Warning: not found under {args.root}: session {', '.join(map(str, missing))}", file=sys.stderr)
+    if not selected:
+        print(f"❌ No session to process under {args.root}"
+              + (f" for --only {args.only}" if args.only is not None else "")
+              + " (a session is a session<N> folder with a craig-*.flac.zip or tracks/*.flac).", file=sys.stderr)
+        return 1
+    if kwargs["run_whisperx"] and kwargs["steps_to_run"].includes(2):
+        image = PipelineConfig().whisperx_docker_image
+        problem = check_docker_image(image)
+        if problem:
+            print(f"❌ Docker preflight failed: {problem}. Start Docker or check the image {image}, "
+                  "then run the batch again. No session was processed.", file=sys.stderr)
+            return 1
     results = run_batch(args.root, only=only, force=args.force, pipeline_kwargs=kwargs)
     print(format_summary(results))
     return 1 if any(r.status == "FAILED" for r in results) else 0

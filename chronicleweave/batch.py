@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +70,22 @@ def parse_only(spec: Optional[str]) -> Optional[Set[int]]:
     return numbers
 
 
+def select_sessions(root: Path, only: Optional[Set[int]]) -> List[SessionDir]:
+    return [s for s in discover_sessions(root) if only is None or s.number in only]
+
+
+def check_docker_image(image: str) -> Optional[str]:
+    """None when `docker image inspect IMAGE` succeeds, else why it failed (docker down, image missing)."""
+    try:
+        proc = subprocess.run(["docker", "image", "inspect", image], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"could not run 'docker image inspect {image}': {e}"
+    if proc.returncode != 0:
+        detail = " ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-2:])
+        return f"'docker image inspect {image}' failed (exit {proc.returncode}): {detail}"
+    return None
+
+
 def run_batch(
     root: Path,
     only: Optional[Set[int]],
@@ -77,9 +94,7 @@ def run_batch(
     runner: Callable[..., None] = run_pipeline,
 ) -> List[BatchResult]:
     results: List[BatchResult] = []
-    for session in discover_sessions(root):
-        if only is not None and session.number not in only:
-            continue
+    for session in select_sessions(root, only):
         log_path = session.path / LOG_FILE_NAME
         if not force and is_session_done(session.path):
             log.info(f"{session.path.name}: already done, skipping.")

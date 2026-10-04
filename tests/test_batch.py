@@ -116,3 +116,17 @@ def test_run_batch_only_and_force(tmp_path):
     calls = []
     run_batch(tmp_path, only={10}, force=True, pipeline_kwargs={}, runner=lambda base_path, **kw: calls.append(base_path))
     assert [Path(c).name for c in calls] == ["session10"]
+
+
+def test_select_sessions_filters_by_number(tmp_path):
+    from chronicleweave.batch import select_sessions
+    _session(tmp_path, "session10")
+    _session(tmp_path, "session11")
+    assert [s.number for s in select_sessions(tmp_path, {11, 35})] == [11]
+    assert [s.number for s in select_sessions(tmp_path, None)] == [10, 11]
+
+
+def test_check_docker_image_reports_failure():
+    from chronicleweave.batch import check_docker_image
+    problem = check_docker_image("chronicleweave-whisperx")  # the test fake docker exits 97
+    assert problem and "97" in problem and "chronicleweave-whisperx" in problem
