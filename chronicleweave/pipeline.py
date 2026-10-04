@@ -176,6 +176,7 @@ class PipelineConfig:
 log = logging.getLogger("chronicleweave.pipeline") # Specific logger for this module
 docker_log = logging.getLogger("chronicleweave.docker")
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "chronicleweave"
+HF_HUB_TIMEOUT_DEFAULTS = {"HF_HUB_DOWNLOAD_TIMEOUT": "120", "HF_HUB_ETAG_TIMEOUT": "60"}  # seconds
 
 
 def redact_command(cmd: Sequence[str]) -> str:
@@ -210,6 +211,10 @@ def build_whisperx_command(
     env_args: List[str] = []
     if environ.get("HF_HUB_OFFLINE"):
         env_args += ["-e", f"HF_HUB_OFFLINE={environ['HF_HUB_OFFLINE']}"]
+    # huggingface_hub's default 10 s read timeout aborted a real model download after 30 min of transfer;
+    # use longer timeouts unless the caller's environment sets its own.
+    for var, default in HF_HUB_TIMEOUT_DEFAULTS.items():
+        env_args += ["-e", f"{var}={environ.get(var) or default}"]
     container_chunks = Path("/app") / config.chunks_audio_folderName
     whisperx_args = [
         "whisperx", *[str(container_chunks / f.name) for f in chunk_files],

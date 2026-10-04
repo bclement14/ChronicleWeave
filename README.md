@@ -64,6 +64,8 @@ ChronicleWeave leverages the powerful **[WhisperX](https://github.com/m-bain/whi
 2.  **Configure GPU Access (Recommended):** For significantly faster transcription, ensure Docker can access your NVIDIA GPU. See [NVIDIA Container Toolkit Installation Guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 3.  **Use the existing image:** Step 2 runs the `chronicleweave-whisperx` image that is already on the machine. The `Dockerfile` only documents what that image contains (pinned versions); it has not been build-tested, so do not run `docker build` over the working image.
 
+The container gets `HF_HUB_DOWNLOAD_TIMEOUT=120` and `HF_HUB_ETAG_TIMEOUT=60` (seconds) so a slow model download is not cut off by the 10 s default; values set in your environment are passed through instead.
+
 `chronicleweave-batch` checks the image once (`docker image inspect chronicleweave-whisperx`) before it processes any session, when step 2 is in the range and `--no-whisperx` is not given; if the check fails it exits with 1 and processes nothing.
 
 ---

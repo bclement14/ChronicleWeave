@@ -146,3 +146,28 @@ def test_docker_stop_failure_is_ignored(tmp_path):
             patch.object(pipeline_module.docker_log, "info", side_effect=OSError("stdout broke")):
         with pytest.raises(OSError, match="stdout broke"):  # the original error, not the cleanup one
             run_whisperx_docker(tmp_path, "chunked_tracks", cfg)
+
+
+# --- F17: longer Hugging Face download timeouts inside the container ---
+
+def _env_pairs(cmd):
+    return {cmd[i + 1].split("=", 1)[0]: cmd[i + 1].split("=", 1)[1] for i, a in enumerate(cmd) if a == "-e"}
+
+
+def test_hub_timeouts_passed_by_default(tmp_path):
+    files = _session(tmp_path)
+    cfg = PipelineConfig(base_path=tmp_path, whisperx_cache_dir=tmp_path / "c")
+    cmd = build_whisperx_command(tmp_path, files, cfg, environ={})
+    pairs = _env_pairs(cmd)
+    assert pairs["HF_HUB_DOWNLOAD_TIMEOUT"] == "120" and pairs["HF_HUB_ETAG_TIMEOUT"] == "60"
+    assert max(i for i, a in enumerate(cmd) if a == "-e") < cmd.index(cfg.whisperx_docker_image)
+
+
+def test_hub_timeouts_from_caller_environment_win(tmp_path):
+    files = _session(tmp_path)
+    cfg = PipelineConfig(base_path=tmp_path, whisperx_cache_dir=tmp_path / "c")
+    cmd = build_whisperx_command(tmp_path, files, cfg,
+                                 environ={"HF_HUB_DOWNLOAD_TIMEOUT": "300", "HF_HUB_ETAG_TIMEOUT": "30"})
+    pairs = _env_pairs(cmd)
+    assert pairs["HF_HUB_DOWNLOAD_TIMEOUT"] == "300" and pairs["HF_HUB_ETAG_TIMEOUT"] == "30"
+    assert cmd.count("-e") == 2  # no default added next to the caller's value
