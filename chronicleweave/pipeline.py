@@ -9,19 +9,6 @@ from dataclasses import dataclass, field, replace, fields
 from typing import Optional, Union, List, Tuple, Sequence, Dict, Any
 import select
 
-# Attempt to load .env file if python-dotenv is available
-try:
-    from dotenv import load_dotenv
-    # Determine the script's directory or a common project root to look for .env
-    # For robustness, you might want to specify a path or use find_dotenv()
-    # load_dotenv(find_dotenv(usecwd=True)) # More robust way to find .env
-    load_dotenv() # Loads .env from current working directory or parents
-    # Logger is not set up yet, so can't log here directly without custom print
-except ImportError:
-    # python-dotenv not installed, which is fine.
-    pass
-
-
 # --- Imports ---
 from .modules.audio_chunker import chunk_audio, ChunkingConfig, DEFAULT_CHUNKING_CONFIG
 from .modules.prepare_tracks import prepare_tracks, DEFAULT_MAPPING_PATH
@@ -242,11 +229,6 @@ def _setup_logger(level: str) -> None:
                 # Optionally, update the level of the existing relevant handler
                 # h.setLevel(min(h.level, numeric_level) if h.level != 0 else numeric_level)
                 pass # For now, don't change existing handler levels
-
-    if 'load_dotenv' in globals() and load_dotenv(): # Check if .env was actually loaded
-        log.debug(".env file loaded successfully.")
-    elif 'load_dotenv' in globals():
-        log.debug(".env file not found or already loaded by another mechanism.")
 
 
 def run_whisperx_docker(
